@@ -367,7 +367,7 @@ _ha_stop_subscription_server() {
 }
 
 _ha_lan_enable() {
-    local cidr=${1:-192.168.0.0/16} user=${2:-clash} password=${CLASHCTL_LAN_PASSWORD:-}
+    local cidr=${1:-192.168.0.0/16} user=${2:-clash} advertised_server=${3:-} password=${CLASHCTL_LAN_PASSWORD:-}
     command -v python3 >/dev/null 2>&1 || {
         _errorcat "局域网订阅服务需要 python3，请安装后重试"
         return 1
@@ -378,7 +378,8 @@ _ha_lan_enable() {
     }
     [ -n "$password" ] || password=$(_ha_random 18)
     local server token port
-    server=$(_get_local_ip)
+    server=$advertised_server
+    [ -n "$server" ] || server=$(_get_local_ip)
     [ -n "$server" ] || {
         _errorcat "无法检测 Linux 局域网 IP，请检查默认路由和网卡地址"
         return 1
@@ -465,14 +466,14 @@ clashha() {
     unpin) "$BIN_YQ" -i '.mode = "auto"' "$CLASH_HA_CONFIG"; _okcat "已解除严格固定" ;;
     lan)
         case "${2:-}" in
-        enable) _ha_lan_enable "${3:-}" "${4:-}" ;;
+        enable) _ha_lan_enable "${3:-}" "${4:-}" "${5:-}" ;;
         disable)
             "$BIN_YQ" -i '.lan.enabled = false' "$CLASH_HA_CONFIG"
             "$BIN_YQ" -i '."allow-lan" = false | ."lan-allowed-ips" = [] | .authentication = []' "$CLASH_CONFIG_MIXIN"
             _ha_stop_subscription_server
             _merge_config_restart && _okcat "局域网入口已关闭"
             ;;
-        *) _errorcat "用法：clashctl ha lan enable [CIDR] [用户名] | disable" ;;
+        *) _errorcat "用法：clashctl ha lan enable [CIDR] [用户名] [对外服务器地址] | disable" ;;
         esac
         ;;
     log) tail "${@:2}" "$CLASH_HA_LOG" ;;
@@ -490,7 +491,7 @@ clashctl ha - 多订阅高可用
   resume                  恢复自动优选
   pin <节点全名>          严格固定节点，故障也不切换
   unpin                   解除严格固定
-  lan enable [CIDR] [用户] 开启局域网代理和客户端订阅
+  lan enable [CIDR] [用户] [地址] 开启局域网代理和客户端订阅
   lan disable             关闭局域网入口
   log [-n 行数]           查看 HA 日志
 

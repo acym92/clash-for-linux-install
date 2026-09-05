@@ -56,7 +56,7 @@ clashctl sub add -n A <订阅地址A>
 clashctl sub add -n B <订阅地址B>
 clashctl sub add -n C <订阅地址C>
 clashctl ha enable
-clashctl ha lan enable 192.168.1.0/24 clash
+clashctl ha lan enable 192.168.1.0/24 clash 192.168.1.10
 clashctl ha status
 
 clashctl -h              # 查看全部命令
