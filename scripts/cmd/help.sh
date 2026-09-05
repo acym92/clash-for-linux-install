@@ -13,6 +13,7 @@ Commands:
   ui                    面板地址
   sub                   订阅管理
   node                  节点切换
+  ha                    多订阅高可用与局域网入口
   tun                   Tun 模式
   mixin                 Mixin 配置
   secret                Web 密钥

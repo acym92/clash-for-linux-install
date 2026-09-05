@@ -10,6 +10,15 @@ CLASHCTL_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 }
 uninstall_service
 
+# 清理多订阅 HA 辅助服务。
+for ha_unit in clashctl-ha.service clashctl-ha-sub.service; do
+    command -v systemctl >/dev/null 2>&1 && systemctl disable --now "$ha_unit" >/dev/null 2>&1 || true
+    /usr/bin/rm -f "/etc/systemd/system/$ha_unit"
+done
+command -v systemctl >/dev/null 2>&1 && systemctl daemon-reload >/dev/null 2>&1 || true
+[ -f "$CLASH_HA_PID" ] && kill "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null || true
+[ -f "$CLASH_HA_SUB_PID" ] && kill "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 2>/dev/null || true
+
 # 清理旧版 sub update --auto 遗留的自管 crontab
 command -v crontab >&/dev/null && {
     crontab -l 2>/dev/null | grep -Fv "$CLASHCTL_CRON_TAG" | crontab -

@@ -29,6 +29,7 @@ on_env_only() {
 
 on_service_only() {
     service_is_active >&/dev/null && {
+        declare -F _ha_ensure_services >/dev/null && _ha_ensure_services
         _okcat "$CLASHCTL_KERNEL 已运行"
         return 0
     }
@@ -38,6 +39,7 @@ on_service_only() {
         _failcat "$CLASHCTL_KERNEL 启动失败"
         return 1
     }
+    declare -F _ha_ensure_services >/dev/null && _ha_ensure_services
     _okcat "$CLASHCTL_KERNEL 已启动"
 }
 

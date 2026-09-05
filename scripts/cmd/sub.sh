@@ -798,6 +798,11 @@ EOF
         ;;
     esac
 
+    if declare -F _ha_enabled >/dev/null && _ha_enabled; then
+        _errorcat "HA 模式正在聚合全部订阅；请先执行 clashctl ha disable 再切换单个订阅"
+        return 1
+    fi
+
     local name=$1
     [ -z "$name" ] && {
         name=$(_sub_pick "请选择要使用的订阅：") || return 1
@@ -1021,7 +1026,7 @@ _sub_update_locked() {
         '(.profiles[] | select(.name == strenv(PROFILE_NAME)) | .userinfo) = strenv(PROFILE_USERINFO)' \
         "$CLASH_PROFILES_META"
 
-    [ "$(_sub_current)" = "$name" ] && {
+    [ "$(_sub_current)" = "$name" ] && ! _ha_enabled 2>/dev/null && {
         _sub_use_locked "$name"
         return
     }

@@ -21,6 +21,7 @@
 - **广泛兼容**：支持 `root` / 普通用户，适配主流 `Linux` 发行版、容器环境及 `systemd` / `OpenRC` 等 `init` 系统。
 - **统一管理**：通过 `clashctl` 管理代理启停、状态查看、日志追踪、Web 面板、TUN 模式、访问密钥与内核升级等。
 - **订阅管理**：支持多订阅源配置、一键新增、切换、更新等，并集成 [subconverter](https://github.com/tindy2013/subconverter) 实现订阅格式转换。
+- **多订阅高可用**：聚合多个订阅的节点，按故障、延迟改善阈值和冷却时间自动切换，并可向局域网设备提供固定代理入口。
 
 ## 🚀 Installation
 
@@ -50,8 +51,18 @@ clashctl sub add <url>   # 添加订阅
 clashctl sub update      # 更新订阅
 clashctl node            # 切换节点
 
+# 多订阅高可用（目前要求 mihomo；建议在 systemd Linux 上以 root 安装）
+clashctl sub add -n A <订阅地址A>
+clashctl sub add -n B <订阅地址B>
+clashctl sub add -n C <订阅地址C>
+clashctl ha enable
+clashctl ha lan enable 192.168.1.0/24 clash
+clashctl ha status
+
 clashctl -h              # 查看全部命令
 ```
+
+`ha lan enable` 会显示局域网 HTTP 代理地址、随机密码和客户端订阅地址。请保存输出；也可随时执行 `clashctl ha status` 查看地址。完整使用方法见 [多订阅高可用使用说明](docs/lan-proxy-ha-usage.md)。
 
 ## 🧹 Uninstall
 

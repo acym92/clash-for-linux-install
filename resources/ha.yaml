@@ -1,0 +1,23 @@
+enabled: false
+group: HA-AUTO
+check-url: http://www.gstatic.com/generate_204
+confirm-url: https://cp.cloudflare.com/generate_204
+interval: 30
+timeout: 5000
+absolute-improvement: 80
+relative-improvement: 30
+performance-confirmations: 3
+failure-confirmations: 2
+cooldown: 600
+last-recovery: 0
+mode: auto
+hold-until: 0
+lan:
+  enabled: false
+  allowed-cidr: "192.168.0.0/16"
+  server: ""
+  port: 7890
+  username: ""
+  password: ""
+  subscription-port: 8088
+  subscription-token: ""
