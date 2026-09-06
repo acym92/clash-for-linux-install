@@ -44,5 +44,11 @@ _ha_build_config
 [ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "CODEX") | .proxies' "$_HA_BUILD_FILE")" = '["CODEX-HA","[A] node-one","[B] node-two"]' ]
 [ "$("$BIN_YQ" -o=json -I=0 '.rules | .[0:5]' "$_HA_BUILD_FILE")" = '["DOMAIN-SUFFIX,chatgpt.com,CODEX","DOMAIN-SUFFIX,openai.com,CODEX","DOMAIN-SUFFIX,oaistatic.com,CODEX","DOMAIN-SUFFIX,oaiusercontent.com,CODEX","DOMAIN-SUFFIX,oaisidekickupdates.blob.core.windows.net,CODEX"]' ]
 [ "$("$BIN_YQ" '.rules[-1]' "$_HA_BUILD_FILE")" = 'MATCH,PROXY' ]
+[ "$("$BIN_YQ" '.profile."store-selected"' "$_HA_BUILD_FILE")" = true ]
+
+PINNED='[B] node-two' "$BIN_YQ" '.codex.mode = "fixed" | .codex."pinned-node" = strenv(PINNED)' "$codex_config" >"${codex_config}.new"
+mv "${codex_config}.new" "$codex_config"
+_ha_build_config
+[ "$("$BIN_YQ" '.proxy-groups[] | select(.name == "CODEX") | .proxies[0]' "$_HA_BUILD_FILE")" = '[B] node-two' ]
 
 printf 'HA config smoke test passed\n'

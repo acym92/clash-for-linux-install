@@ -19,6 +19,8 @@ region-preference:
     - other
 codex:
   enabled: false
+  mode: auto
+  pinned-node: ""
   group: CODEX
   auto-group: CODEX-HA
   check-url: https://chatgpt.com/robots.txt
