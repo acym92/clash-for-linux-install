@@ -359,6 +359,12 @@ _ha_recover() {
 
 _ha_daemon() {
     _ha_enabled || return 0
+    local lock_file="${CLASH_HA_PID}.lock"
+    exec 9>"$lock_file"
+    /usr/bin/flock -n 9 || {
+        _errorcat "HA 调度器已运行"
+        return 1
+    }
     if [ -f "$CLASH_HA_PID" ] && kill -0 "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null; then
         _errorcat "HA 调度器已运行"
         return 1
@@ -366,7 +372,7 @@ _ha_daemon() {
     printf '%s\n' "$$" >"$CLASH_HA_PID"
     trap '/usr/bin/rm -f "$CLASH_HA_PID"' EXIT INT TERM
     _ha_log "HA 调度器启动"
-    while _ha_enabled; do
+    while _ha_enabled && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" = "$$" ]; do
         _ha_check_once || _ha_log "WARN 本轮检测失败，等待内核/API 就绪"
         sleep "$(_ha_get '.interval' '30')" & wait $!
     done
@@ -400,7 +406,16 @@ _ha_stop_daemon() {
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files clashctl-ha.service >/dev/null 2>&1; then
         systemctl disable --now clashctl-ha.service >/dev/null 2>&1 || true
     fi
-    [ -f "$CLASH_HA_PID" ] && kill "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null || true
+    local pid='' i
+    [ -f "$CLASH_HA_PID" ] && pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    if [ -n "$pid" ]; then
+        for ((i = 0; i < 50; i++)); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+    fi
     /usr/bin/rm -f "$CLASH_HA_PID"
 }
 
