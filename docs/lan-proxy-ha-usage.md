@@ -104,9 +104,17 @@ relative-improvement: 30
 performance-confirmations: 3
 failure-confirmations: 2
 cooldown: 600
+region-preference:
+  enabled: true
+  tolerance: 50
+  order: [taiwan, japan, hong-kong, other]
 ```
 
 修改后无需重建候选池，调度器下一轮会读取新值。修改 `group` 则必须执行 `clashctl ha refresh`。
+
+地区偏好只在节点延迟不超过本轮最快节点 50ms 时生效；默认顺序是台湾、日本、香港、其他。同一地区仍选择延迟最低的节点。地区优先切换与普通性能切换一样，需要连续三轮确认并遵守冷却时间。设置 `region-preference.enabled: false` 可关闭地区偏好。
+
+自动切换只在 `mode: auto` 时执行。使用 `clashctl ha pin '<节点全名>'` 后进入 `pin` 模式，即使固定节点故障也不会切换；使用 `clashctl ha unpin` 才会恢复自动模式。Web 面板直接选择节点不会修改 HA 模式，需要严格固定时应使用 `ha pin`。
 
 ## 已知边界
 

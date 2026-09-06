@@ -9,6 +9,14 @@ relative-improvement: 30
 performance-confirmations: 3
 failure-confirmations: 2
 cooldown: 600
+region-preference:
+  enabled: true
+  tolerance: 50
+  order:
+    - taiwan
+    - japan
+    - hong-kong
+    - other
 last-recovery: 0
 mode: auto
 hold-until: 0

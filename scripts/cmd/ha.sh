@@ -148,10 +148,78 @@ _ha_record_switch() {
       '."last-switch" = (env(SWITCH_AT) | tonumber) | ."last-reason" = strenv(SWITCH_REASON)' "$CLASH_HA_STATE"
 }
 
+_ha_region_key() {
+    local name=${1,,}
+    if [[ "$name" == *台湾* || "$name" == *台灣* || "$name" == *臺灣* || "$name" == *taiwan* || "$name" == *🇹🇼* || "$name" =~ (^|[^a-z])tw([^a-z]|$) ]]; then
+        printf 'taiwan\n'
+    elif [[ "$name" == *日本* || "$name" == *东京* || "$name" == *東京* || "$name" == *大阪* || "$name" == *japan* || "$name" == *🇯🇵* || "$name" =~ (^|[^a-z])jp([^a-z]|$) ]]; then
+        printf 'japan\n'
+    elif [[ "$name" == *香港* || "$name" == *hongkong* || "$name" == *"hong kong"* || "$name" == *🇭🇰* || "$name" =~ (^|[^a-z])hk([^a-z]|$) ]]; then
+        printf 'hong-kong\n'
+    else
+        printf 'other\n'
+    fi
+}
+
+_ha_region_rank() {
+    local key order entry rank=0
+    key=$(_ha_region_key "$1")
+    order=$2
+    while IFS= read -r entry; do
+        entry=${entry//[[:space:]]/}
+        [ "$entry" = "$key" ] && { printf '%s\n' "$rank"; return; }
+        rank=$((rank + 1))
+    done < <(tr ',' '\n' <<<"$order")
+    printf '999\n'
+}
+
+_ha_mode_allows_performance_switch() {
+    [ "$1" = auto ]
+}
+
+_ha_mode_allows_failure_switch() {
+    [ "$1" != pin ]
+}
+
+# 从有效的 name<TAB>delay 行中选择候选。地区偏好只在最快延迟加容差的
+# 范围内生效，因此偏好地区的慢节点不会压过明显更快的其他地区节点。
+_ha_select_best() {
+    local tolerance=$1 order=$2 enabled=$3 name delay fastest='' rank best_rank=999
+    local best='' best_delay=''
+    local names=() delays=()
+    while IFS=$'\t' read -r name delay; do
+        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] || continue
+        names+=("$name")
+        delays+=("$delay")
+        [ -z "$fastest" ] || [ "$delay" -ge "$fastest" ] || fastest=$delay
+        [ -n "$fastest" ] || fastest=$delay
+    done
+    [ -n "$fastest" ] || return 0
+
+    local i
+    for ((i = 0; i < ${#names[@]}; i++)); do
+        name=${names[$i]}
+        delay=${delays[$i]}
+        if [ "$enabled" = true ]; then
+            [ "$delay" -le $((fastest + tolerance)) ] || continue
+            rank=$(_ha_region_rank "$name" "$order")
+        else
+            rank=0
+        fi
+        if [ -z "$best" ] || [ "$rank" -lt "$best_rank" ] || { [ "$rank" -eq "$best_rank" ] && [ "$delay" -lt "$best_delay" ]; }; then
+            best=$name
+            best_delay=$delay
+            best_rank=$rank
+        fi
+    done
+    [ -n "$best" ] && printf '%s\t%s\n' "$best" "$best_delay"
+}
+
 _ha_check_once() {
     service_is_active >/dev/null 2>&1 || return 1
     local group url confirm_url timeout current best='' best_delay='' current_delay=''
     local name delay failures candidate candidate_count now mode hold_until reason=healthy
+    local region_enabled region_tolerance region_order delay_rows
     group=$(_ha_get '.group' '"HA-AUTO"')
     url=$(_ha_get '.check-url' '"http://www.gstatic.com/generate_204"')
     confirm_url=$(_ha_get '.confirm-url' '"https://cp.cloudflare.com/generate_204"')
@@ -165,14 +233,15 @@ _ha_check_once() {
     done < <(_node_members "$group")
     [ ${#members[@]} -gt 0 ] || return 1
 
+    region_enabled=$(_ha_get '.region-preference.enabled' 'true')
+    region_tolerance=$(_ha_get '.region-preference.tolerance' '50')
+    region_order=$(_ha_get '(.region-preference.order // ["taiwan", "japan", "hong-kong", "other"]) | join(",")' '"taiwan,japan,hong-kong,other"')
+    delay_rows=$(_node_delay_rows "$group" "$url" "$timeout" "${members[@]}")
     while IFS=$'\t' read -r name delay; do
         [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] || continue
         [ "$name" = "$current" ] && current_delay=$delay
-        if [ -z "$best_delay" ] || [ "$delay" -lt "$best_delay" ]; then
-            best=$name
-            best_delay=$delay
-        fi
-    done < <(_node_delay_rows "$group" "$url" "$timeout" "${members[@]}")
+    done <<<"$delay_rows"
+    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows")
 
     failures=$(_ha_state_get '.failures' '0')
     candidate=$(_ha_state_get '.candidate' '""')
@@ -195,7 +264,7 @@ _ha_check_once() {
         else
             failures=$((failures + 1))
             reason="当前节点探测失败 ${failures} 次"
-            if [ "$mode" != pin ] && [ -n "$best" ] && [ "$failures" -ge "$(_ha_get '.failure-confirmations' '2')" ]; then
+            if _ha_mode_allows_failure_switch "$mode" && [ -n "$best" ] && [ "$failures" -ge "$(_ha_get '.failure-confirmations' '2')" ]; then
                 _node_apply "$group" "$best" >/dev/null && {
                     reason="故障切换：$current -> $best"
                     _ha_log "$reason"
@@ -212,8 +281,9 @@ _ha_check_once() {
         fi
     else
         failures=0
-        if [ "$mode" = auto ] && [ -n "$best" ] && [ "$best" != "$current" ]; then
+        if _ha_mode_allows_performance_switch "$mode" && [ -n "$best" ] && [ "$best" != "$current" ]; then
             local abs rel required improvement last_switch cooldown confirmations
+            local current_region_rank best_region_rank region_preferred=false switch_kind=performance
             abs=$(_ha_get '.absolute-improvement' '80')
             rel=$(_ha_get '.relative-improvement' '30')
             required=$((current_delay * rel / 100))
@@ -222,12 +292,26 @@ _ha_check_once() {
             last_switch=$(_ha_state_get '."last-switch"' '0')
             cooldown=$(_ha_get '.cooldown' '600')
             confirmations=$(_ha_get '.performance-confirmations' '3')
-            if [ "$improvement" -ge "$required" ] && [ $((now - last_switch)) -ge "$cooldown" ]; then
+            current_region_rank=$(_ha_region_rank "$current" "$region_order")
+            best_region_rank=$(_ha_region_rank "$best" "$region_order")
+            if [ "$region_enabled" = true ] && [ "$best_region_rank" -lt "$current_region_rank" ] && [ "$best_delay" -le $((current_delay + region_tolerance)) ]; then
+                region_preferred=true
+                switch_kind=region
+            fi
+            if { [ "$region_preferred" = true ] || [ "$improvement" -ge "$required" ]; } && [ $((now - last_switch)) -ge "$cooldown" ]; then
                 if [ "$candidate" = "$best" ]; then candidate_count=$((candidate_count + 1)); else candidate=$best; candidate_count=1; fi
-                reason="候选改善 ${improvement}ms，确认 ${candidate_count}/${confirmations}"
+                if [ "$switch_kind" = region ]; then
+                    reason="地区优先候选（相差 ${improvement#-}ms），确认 ${candidate_count}/${confirmations}"
+                else
+                    reason="候选改善 ${improvement}ms，确认 ${candidate_count}/${confirmations}"
+                fi
                 if [ "$candidate_count" -ge "$confirmations" ]; then
                     _node_apply "$group" "$best" >/dev/null && {
-                        reason="性能切换：$current(${current_delay}ms) -> $best(${best_delay}ms)"
+                        if [ "$switch_kind" = region ]; then
+                            reason="地区优先切换：$current(${current_delay}ms) -> $best(${best_delay}ms)"
+                        else
+                            reason="性能切换：$current(${current_delay}ms) -> $best(${best_delay}ms)"
+                        fi
                         _ha_log "$reason"
                         current=$best
                         current_delay=$best_delay
@@ -248,7 +332,7 @@ _ha_check_once() {
         fi
     fi
     _ha_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" "$failures" "$candidate" "$candidate_count" "$reason"
-    if [ -z "$best" ] && [ "$failures" -ge "$(_ha_get '.failure-confirmations' '2')" ]; then
+    if _ha_mode_allows_failure_switch "$mode" && [ -z "$best" ] && [ "$failures" -ge "$(_ha_get '.failure-confirmations' '2')" ]; then
         _ha_recover "$now"
     fi
 }
