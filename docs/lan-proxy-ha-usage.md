@@ -67,6 +67,36 @@ clashctl ha log -n 50          # 最近日志
 clashctl ha refresh --update   # 更新全部订阅并重建候选池；会重启一次内核
 ```
 
+## Codex / OpenAI 专用高可用
+
+如果普通网页可用，但 Codex 经常连接失败，可启用独立的 `CODEX` 策略组：
+
+```bash
+clashctl ha codex enable       # 建组、重启一次内核并立即优选
+clashctl ha codex status       # 查看自动/固定模式、当前节点和判断原因
+clashctl ha codex check        # 立即执行一轮检测
+```
+
+OpenAI、ChatGPT 及相关静态资源域名会进入 `CODEX`。调度器分别检测 ChatGPT 页面入口和 OpenAI API 鉴权入口，只有两个目标都返回预期状态的节点才进入候选池，并使用较慢的一次延迟作为评分。默认每 120 秒检测一次；当前节点连续失败两轮会故障切换。性能切换要求候选至少快 150ms、同时改善至少 30%，连续三轮成立且冷却 30 分钟；存在 OpenAI 活跃连接时会推迟性能切换。
+
+Web UI 中 `CODEX` 默认选择 `CODEX-HA`，此时自动逻辑生效。在 `CODEX` 中直接选择任一具体节点后即进入固定模式，调度器不会进行性能或故障切换；恢复自动模式使用：
+
+```bash
+clashctl ha codex auto
+```
+
+也可以从命令行固定节点：
+
+```bash
+clashctl ha codex pin '[订阅名] 节点名'
+```
+
+关闭专用策略并恢复原规则：
+
+```bash
+clashctl ha codex disable
+```
+
 后台默认每 30 秒检测一次。性能切换要求候选至少快 80ms、同时改善至少 30%，并连续三轮成立；性能切换后冷却 10 分钟。当前节点连续两轮在主目标和确认目标上都失败时，会切换到本轮可用的最低延迟节点。
 
 会议、长下载期间可以暂停性能切换，故障切换仍然保留：
@@ -108,13 +138,21 @@ region-preference:
   enabled: true
   tolerance: 100
   order: [taiwan, japan, hong-kong, other]
+codex:
+  interval: 120
+  absolute-improvement: 150
+  relative-improvement: 30
+  performance-confirmations: 3
+  failure-confirmations: 2
+  cooldown: 1800
+  protect-active-connections: true
 ```
 
 修改后无需重建候选池，调度器下一轮会读取新值。修改 `group` 则必须执行 `clashctl ha refresh`。
 
 地区偏好只在节点延迟不超过本轮最快节点 100ms 时生效；默认顺序是台湾、日本、香港、其他。同一地区仍选择延迟最低的节点。地区优先切换与普通性能切换一样，需要连续三轮确认并遵守冷却时间。设置 `region-preference.enabled: false` 可关闭地区偏好。
 
-自动切换只在 `mode: auto` 时执行。使用 `clashctl ha pin '<节点全名>'` 后进入 `pin` 模式，即使固定节点故障也不会切换；使用 `clashctl ha unpin` 才会恢复自动模式。Web 面板直接选择节点不会修改 HA 模式，需要严格固定时应使用 `ha pin`。
+通用 `HA-AUTO` 的自动切换只在 `mode: auto` 时执行。使用 `clashctl ha pin '<节点全名>'` 后进入 `pin` 模式，即使固定节点故障也不会切换；使用 `clashctl ha unpin` 才会恢复自动模式。Codex 专用组则直接读取 Web UI 中 `CODEX` 的选择，选中具体节点后不会自动切换，选回 `CODEX-HA` 或运行 `clashctl ha codex auto` 才恢复自动模式。
 
 ## 已知边界
 

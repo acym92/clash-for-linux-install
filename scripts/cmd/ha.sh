@@ -11,6 +11,20 @@ _ha_enabled() {
     [ -f "$CLASH_HA_CONFIG" ] && "$BIN_YQ" -e '.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1
 }
 
+_ha_pid_running() {
+    local pid=${1:-} expected=${2:-} stat state args=()
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    [ -r "/proc/$pid/stat" ] || return 1
+    stat=$(<"/proc/$pid/stat")
+    state=${stat#*) }
+    state=${state%% *}
+    [ "$state" != Z ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -z "$expected" ] && return 0
+    mapfile -d '' args <"/proc/$pid/cmdline" 2>/dev/null || return 1
+    [[ " ${args[*]} " == *"$expected"* ]]
+}
+
 _ha_state_get() {
     [ -f "$CLASH_HA_STATE" ] || {
         "$BIN_YQ" -n "$2" 2>/dev/null
@@ -33,7 +47,7 @@ _ha_build_config() {
         return 1
     }
 
-    local template_name template_path group nodes part work name path count=0
+    local template_name template_path group codex_enabled codex_group codex_auto_group codex_domains nodes part work name path count=0
     template_name=$(_sub_current)
     [ -n "$template_name" ] || template_name=$(_sub_names | head -n1)
     [ -n "$template_name" ] || {
@@ -47,6 +61,10 @@ _ha_build_config() {
     }
 
     group=$(_ha_get '.group' '"HA-AUTO"')
+    codex_enabled=$(_ha_get '.codex.enabled' 'false')
+    codex_group=$(_ha_get '.codex.group' '"CODEX"')
+    codex_auto_group=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
+    codex_domains=$(_ha_get '(.codex.domains // ["chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com"]) | join(",")' '"chatgpt.com,openai.com,oaistatic.com,oaiusercontent.com"')
     nodes=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-nodes.XXXXXX") || return 1
     part=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-part.XXXXXX") || {
         /usr/bin/rm -f "$nodes"
@@ -83,20 +101,30 @@ _ha_build_config() {
         return 1
     }
 
-    HA_GROUP=$group "$BIN_YQ" eval-all '
+    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_DOMAINS=$codex_domains "$BIN_YQ" eval-all '
       select(fileIndex == 0) as $config |
       select(fileIndex == 1) as $nodes |
       strenv(HA_GROUP) as $ha |
+      strenv(CODEX_GROUP) as $codex |
+      strenv(CODEX_AUTO_GROUP) as $codexAuto |
+      (strenv(CODEX_ENABLED) == "true") as $codexEnabled |
       $config |
       .proxies = $nodes |
       (.proxy-groups // []) as $old |
       .proxy-groups = (
-        ($old | map(select(.name != $ha) |
+        ($old | map(select(.name != $ha and .name != $codex and .name != $codexAuto) |
           {"name": .name, "type": "select", "proxies": [$ha]})) +
-        [{"name": $ha, "type": "select", "proxies": ($nodes | map(.name))}]
+        [{"name": $ha, "type": "select", "proxies": ($nodes | map(.name))}] +
+        ((
+          [{"name": $codex, "type": "select", "proxies": ([$codexAuto] + ($nodes | map(.name)))},
+           {"name": $codexAuto, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))}]
+          | select($codexEnabled)
+        ) // [])
       ) |
       .rules = ((.rules // []) as $rules |
-        ($rules | select(length > 0)) // ["MATCH," + $ha])
+        (($rules | select(length > 0)) // ["MATCH," + $ha]) as $baseRules |
+        ((((strenv(CODEX_DOMAINS) | split(",") | map("DOMAIN-SUFFIX," + . + "," + $codex)) + $baseRules)
+          | select($codexEnabled)) // $baseRules))
     ' "$template_path" "$nodes" >"$work"
     /usr/bin/rm -f "$nodes" "$part"
 
@@ -124,6 +152,7 @@ _ha_build_and_restart() {
         return 1
     fi
     /usr/bin/rm -f "$backup"
+    /usr/bin/rm -f "$CLASH_HA_CODEX_STATE"
     _okcat "已聚合 $_HA_BUILD_COUNT 个节点到 [$(_ha_get '.group' '"HA-AUTO"')]"
 }
 
@@ -217,6 +246,211 @@ _ha_select_best() {
         fi
     done
     [ -n "$best" ] && printf '%s\t%s\n' "$best" "$best_delay"
+}
+
+_ha_codex_enabled() {
+    _ha_enabled && [ "$(_ha_get '.codex.enabled' 'false')" = true ]
+}
+
+_ha_codex_state_get() {
+    [ -f "$CLASH_HA_CODEX_STATE" ] || {
+        "$BIN_YQ" -n "$2" 2>/dev/null
+        return
+    }
+    "$BIN_YQ" "$1 // $2" "$CLASH_HA_CODEX_STATE" 2>/dev/null
+}
+
+_ha_codex_write_state() {
+    local now=$1 current=$2 current_delay=$3 best=$4 best_delay=$5 failures=$6 candidate=$7 candidate_count=$8 reason=$9
+    local last_switch
+    last_switch=$(_ha_codex_state_get '."last-switch"' '0')
+    CHECKED=$now CURRENT=$current CURRENT_DELAY=$current_delay BEST=$best BEST_DELAY=$best_delay \
+      FAILURES=$failures CANDIDATE=$candidate CANDIDATE_COUNT=$candidate_count REASON=$reason LAST_SWITCH=$last_switch \
+      "$BIN_YQ" -n '
+        {"checked-at": (env(CHECKED) | tonumber), "current": strenv(CURRENT),
+         "current-delay": strenv(CURRENT_DELAY), "best": strenv(BEST),
+         "best-delay": strenv(BEST_DELAY), "failures": (env(FAILURES) | tonumber),
+         "candidate": strenv(CANDIDATE), "candidate-count": (env(CANDIDATE_COUNT) | tonumber),
+         "last-reason": strenv(REASON), "last-switch": (env(LAST_SWITCH) | tonumber)}
+      ' >"${CLASH_HA_CODEX_STATE}.new" && /bin/mv -f "${CLASH_HA_CODEX_STATE}.new" "$CLASH_HA_CODEX_STATE"
+}
+
+_ha_codex_record_switch() {
+    local now=$1 reason=$2
+    SWITCH_AT=$now SWITCH_REASON=$reason "$BIN_YQ" -i \
+      '."last-switch" = (env(SWITCH_AT) | tonumber) | ."last-reason" = strenv(SWITCH_REASON)' "$CLASH_HA_CODEX_STATE"
+}
+
+# Only nodes that can reach both ChatGPT and the OpenAI authentication edge are
+# eligible for CODEX-HA. The slower result is used as the service latency score.
+_ha_codex_healthy_rows() {
+    local group=$1 check_url=$2 check_expected=$3 confirm_url=$4 confirm_expected=$5 timeout=$6
+    shift 6
+    local members=("$@") primary_rows confirm_rows name delay other
+    declare -A primary=() confirmed=()
+    primary_rows=$(CLASHCTL_NODE_EXPECTED_STATUS=$check_expected _node_delay_rows "$group" "$check_url" "$timeout" "${members[@]}")
+    confirm_rows=$(CLASHCTL_NODE_EXPECTED_STATUS=$confirm_expected _node_delay_rows "$group" "$confirm_url" "$timeout" "${members[@]}")
+    while IFS=$'\t' read -r name delay; do
+        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] && primary["$name"]=$delay
+    done <<<"$primary_rows"
+    while IFS=$'\t' read -r name delay; do
+        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] && confirmed["$name"]=$delay
+    done <<<"$confirm_rows"
+    for name in "${members[@]}"; do
+        delay=${primary["$name"]:-}
+        other=${confirmed["$name"]:-}
+        [ -n "$delay" ] && [ -n "$other" ] || continue
+        [ "$other" -le "$delay" ] || delay=$other
+        printf '%s\t%s\n' "$name" "$delay"
+    done
+}
+
+_ha_codex_active_connections() {
+    local domains host domain count=0 resp
+    domains=$(_ha_get '(.codex.domains // []) | join(",")' '""')
+    [ -n "$domains" ] || { printf '0\n'; return; }
+    resp=$(_node_curl GET '/connections') || { printf '0\n'; return; }
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        while IFS= read -r domain; do
+            [ -n "$domain" ] || continue
+            if [ "$host" = "$domain" ] || [[ "$host" == *."$domain" ]]; then
+                count=$((count + 1))
+                break
+            fi
+        done < <(tr ',' '\n' <<<"$domains")
+    done < <("$BIN_YQ" -p json '.connections[]?.metadata.host // ""' <<<"$resp" 2>/dev/null)
+    printf '%s\n' "$count"
+}
+
+_ha_codex_check_once() {
+    _ha_codex_enabled || return 0
+    service_is_active >/dev/null 2>&1 || return 1
+    local entry_group entry_selected group check_url check_expected confirm_url confirm_expected timeout current best='' best_delay='' current_delay=''
+    local failures candidate candidate_count now mode reason=healthy delay_rows checked_at initialized
+    local region_enabled region_tolerance region_order name delay
+    entry_group=$(_ha_get '.codex.group' '"CODEX"')
+    group=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
+    entry_selected=$(_node_now "$entry_group")
+    [ -n "$entry_selected" ] || return 1
+    if [ "$entry_selected" != "$group" ]; then
+        now=$(date +%s)
+        reason="Codex 固定节点：$entry_selected"
+        _ha_codex_write_state "$now" "$entry_selected" '' "$entry_selected" '' 0 '' 0 "$reason"
+        return 0
+    fi
+    check_url=$(_ha_get '.codex.check-url' '"https://chatgpt.com/robots.txt"')
+    check_expected=$(_ha_get '.codex.check-expected-status' '200')
+    confirm_url=$(_ha_get '.codex.confirm-url' '"https://api.openai.com/v1/models"')
+    confirm_expected=$(_ha_get '.codex.confirm-expected-status' '401')
+    timeout=$(_ha_get '.codex.timeout' '8000')
+    current=$(_node_now "$group")
+    [ -n "$current" ] || return 1
+
+    local members=()
+    while IFS= read -r name; do
+        [ -n "$name" ] && members+=("$name")
+    done < <(_node_members "$group")
+    [ ${#members[@]} -gt 0 ] || return 1
+
+    region_enabled=$(_ha_get '.region-preference.enabled' 'true')
+    region_tolerance=$(_ha_get '.region-preference.tolerance' '100')
+    region_order=$(_ha_get '(.region-preference.order // ["taiwan", "japan", "hong-kong", "other"]) | join(",")' '"taiwan,japan,hong-kong,other"')
+    delay_rows=$(_ha_codex_healthy_rows "$group" "$check_url" "$check_expected" "$confirm_url" "$confirm_expected" "$timeout" "${members[@]}")
+    while IFS=$'\t' read -r name delay; do
+        [ "$name" = "$current" ] && current_delay=$delay
+    done <<<"$delay_rows"
+    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows")
+
+    failures=$(_ha_codex_state_get '.failures' '0')
+    candidate=$(_ha_codex_state_get '.candidate' '""')
+    candidate_count=$(_ha_codex_state_get '."candidate-count"' '0')
+    checked_at=$(_ha_codex_state_get '."checked-at"' '0')
+    [ "$checked_at" -gt 0 ] && initialized=true || initialized=false
+    now=$(date +%s)
+    mode=auto
+
+    if [ -z "$current_delay" ]; then
+        failures=$((failures + 1))
+        reason="Codex 当前节点双目标探测失败 ${failures} 次"
+        if [ -n "$best" ] && [ "$failures" -ge "$(_ha_get '.codex.failure-confirmations' '2')" ]; then
+            _node_apply "$group" "$best" >/dev/null && {
+                reason="Codex 故障切换：$current -> $best"
+                _ha_log "$reason"
+                failures=0
+                current=$best
+                current_delay=$best_delay
+                candidate=''
+                candidate_count=0
+                _ha_codex_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" "$failures" "$candidate" "$candidate_count" "$reason"
+                _ha_codex_record_switch "$now" "$reason"
+                return 0
+            }
+        fi
+    else
+        failures=0
+        if [ "$initialized" = false ] && [ -n "$best" ] && [ "$best" != "$current" ]; then
+            _node_apply "$group" "$best" >/dev/null && {
+                reason="Codex 启动优选：$current(${current_delay}ms) -> $best(${best_delay}ms)"
+                _ha_log "$reason"
+                current=$best
+                current_delay=$best_delay
+                _ha_codex_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" 0 '' 0 "$reason"
+                _ha_codex_record_switch "$now" "$reason"
+                return 0
+            }
+        elif [ "$mode" = auto ] && [ -n "$best" ] && [ "$best" != "$current" ]; then
+            local abs rel required improvement last_switch cooldown confirmations active protect_active
+            abs=$(_ha_get '.codex.absolute-improvement' '150')
+            rel=$(_ha_get '.codex.relative-improvement' '30')
+            required=$((current_delay * rel / 100))
+            [ "$required" -lt "$abs" ] && required=$abs
+            improvement=$((current_delay - best_delay))
+            last_switch=$(_ha_codex_state_get '."last-switch"' '0')
+            cooldown=$(_ha_get '.codex.cooldown' '1800')
+            confirmations=$(_ha_get '.codex.performance-confirmations' '3')
+            if [ "$improvement" -ge "$required" ] && [ $((now - last_switch)) -ge "$cooldown" ]; then
+                if [ "$candidate" = "$best" ]; then candidate_count=$((candidate_count + 1)); else candidate=$best; candidate_count=1; fi
+                reason="Codex 性能候选改善 ${improvement}ms，确认 ${candidate_count}/${confirmations}"
+                if [ "$candidate_count" -ge "$confirmations" ]; then
+                    protect_active=$(_ha_get '.codex.protect-active-connections' 'true')
+                    active=0
+                    [ "$protect_active" = true ] && active=$(_ha_codex_active_connections)
+                    if [ "$active" -gt 0 ]; then
+                        candidate_count=$confirmations
+                        reason="Codex 有 ${active} 条活跃连接，推迟性能切换"
+                    else
+                        _node_apply "$group" "$best" >/dev/null && {
+                            reason="Codex 性能切换：$current(${current_delay}ms) -> $best(${best_delay}ms)"
+                            _ha_log "$reason"
+                            current=$best
+                            current_delay=$best_delay
+                            candidate=''
+                            candidate_count=0
+                            _ha_codex_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" 0 "$candidate" "$candidate_count" "$reason"
+                            _ha_codex_record_switch "$now" "$reason"
+                            return 0
+                        }
+                    fi
+                fi
+            else
+                candidate=''
+                candidate_count=0
+                reason="Codex 延迟差未达到切换阈值"
+            fi
+        fi
+    fi
+    _ha_codex_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" "$failures" "$candidate" "$candidate_count" "$reason"
+}
+
+_ha_codex_check_if_due() {
+    _ha_codex_enabled || return 0
+    local now last interval
+    now=$(date +%s)
+    last=$(_ha_codex_state_get '."checked-at"' '0')
+    interval=$(_ha_get '.codex.interval' '120')
+    [ $((now - last)) -ge "$interval" ] || return 0
+    _ha_codex_check_once
 }
 
 _ha_check_once() {
@@ -365,7 +599,7 @@ _ha_daemon() {
         _errorcat "HA 调度器已运行"
         return 1
     }
-    if [ -f "$CLASH_HA_PID" ] && kill -0 "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null; then
+    if [ -f "$CLASH_HA_PID" ] && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" != "$$" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
         _errorcat "HA 调度器已运行"
         return 1
     fi
@@ -374,12 +608,13 @@ _ha_daemon() {
     _ha_log "HA 调度器启动"
     while _ha_enabled && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" = "$$" ]; do
         _ha_check_once || _ha_log "WARN 本轮检测失败，等待内核/API 就绪"
+        _ha_codex_check_if_due || _ha_log "WARN Codex 本轮检测失败，等待内核/API 就绪"
         sleep "$(_ha_get '.interval' '30')" & wait $!
     done
 }
 
 _ha_install_daemon() {
-    [ -f "$CLASH_HA_PID" ] && kill -0 "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null && return 0
+    [ -f "$CLASH_HA_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon' && return 0
     detect_service_manager
     if [ "$service_manager" = systemd ] && _is_root; then
         local unit=/etc/systemd/system/clashctl-ha.service
@@ -390,7 +625,17 @@ _ha_install_daemon() {
         } >"$unit"
         systemctl daemon-reload && systemctl enable --now clashctl-ha.service
     else
-        nohup env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' >"$CLASH_HA_LOG" 2>&1 &
+        (
+            local launch_lock="${CLASH_HA_PID}.launch.lock" pid
+            exec 8>"$launch_lock"
+            /usr/bin/flock -n 8 || exit 0
+            if [ -f "$CLASH_HA_PID" ]; then
+                pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
+                [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && exit 0
+            fi
+            nohup env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
+            printf '%s\n' "$!" >"$CLASH_HA_PID"
+        )
     fi
 }
 
@@ -408,13 +653,13 @@ _ha_stop_daemon() {
     fi
     local pid='' i
     [ -f "$CLASH_HA_PID" ] && pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
-    [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+    [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && kill "$pid" 2>/dev/null || true
     if [ -n "$pid" ]; then
         for ((i = 0; i < 50; i++)); do
-            kill -0 "$pid" 2>/dev/null || break
+            _ha_pid_running "$pid" 'clashctl ha daemon' || break
             sleep 0.1
         done
-        kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null || true
+        _ha_pid_running "$pid" 'clashctl ha daemon' && kill -9 "$pid" 2>/dev/null || true
     fi
     /usr/bin/rm -f "$CLASH_HA_PID"
 }
@@ -447,6 +692,9 @@ _ha_start_subscription_server() {
     token=$(_ha_get '.lan.subscription-token' '""')
     cidr=$(_ha_get '.lan.allowed-cidr' '"192.168.0.0/16"')
     [ -n "$token" ] || return 1
+    if [ -f "$CLASH_HA_SUB_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 'scripts/ha/serve.py'; then
+        return 0
+    fi
     printf '%s\n' "$token" >"$CLASH_HA_SUB_TOKEN"
     chmod 600 "$CLASH_HA_SUB_TOKEN" "$CLASH_HA_CONFIG"
     _ha_stop_subscription_server
@@ -471,7 +719,7 @@ _ha_stop_subscription_server() {
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files clashctl-ha-sub.service >/dev/null 2>&1; then
         systemctl disable --now clashctl-ha-sub.service >/dev/null 2>&1 || true
     fi
-    [ -f "$CLASH_HA_SUB_PID" ] && kill "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 2>/dev/null || true
+    [ -f "$CLASH_HA_SUB_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 'scripts/ha/serve.py' && kill "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 2>/dev/null || true
     /usr/bin/rm -f "$CLASH_HA_SUB_PID"
 }
 
@@ -508,14 +756,34 @@ _ha_lan_enable() {
     _merge_config_restart || return 1
     chmod 600 "$CLASH_HA_CONFIG" "$CLASH_CONFIG_MIXIN" "$CLASH_CONFIG_RUNTIME"
     _ha_client_config
+    _ha_stop_subscription_server
     _ha_start_subscription_server || return 1
     _okcat "局域网代理：http://${server}:${port}（用户：$user，密码：$password）"
     _okcat "客户端订阅：http://${server}:$(_ha_get '.lan.subscription-port' '8088')/sub/${token}"
 }
 
+_ha_codex_status() {
+    if ! _ha_codex_enabled; then
+        printf 'Codex HA：停用\n'
+        return 0
+    fi
+    local entry auto selected current mode
+    entry=$(_ha_get '.codex.group' '"CODEX"')
+    auto=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
+    selected=$(_node_now "$entry")
+    current=$(_node_now "$auto")
+    [ "$selected" = "$auto" ] && mode=auto || mode=fixed
+    printf 'Codex HA：启用（%s）\n' "$mode"
+    printf 'Codex 入口：%s -> %s\n' "$entry" "${selected:-—}"
+    printf 'Codex 当前节点：%s (%sms)\n' "${current:-—}" "$(_ha_codex_state_get '."current-delay"' '"—"')"
+    printf 'Codex 本轮最优：%s (%sms)\n' "$(_ha_codex_state_get '.best' '"—"')" "$(_ha_codex_state_get '."best-delay"' '"—"')"
+    printf 'Codex 最近判断：%s\n' "$(_ha_codex_state_get '."last-reason"' '"尚未检测"')"
+    printf 'Codex 检测时间：%s\n' "$(_ha_codex_state_get '."checked-at"' '"—"')"
+}
+
 _ha_status() {
     printf 'HA：%s\n' "$(if _ha_enabled; then printf '启用'; else printf '停用'; fi)"
-    if [ -f "$CLASH_HA_PID" ] && kill -0 "$(cat "$CLASH_HA_PID" 2>/dev/null)" 2>/dev/null; then
+    if [ -f "$CLASH_HA_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
         printf '调度器：运行中\n'
     else
         printf '调度器：未运行\n'
@@ -526,6 +794,7 @@ _ha_status() {
     printf '本轮最优：%s (%sms)\n' "$(_ha_state_get '.best' '"—"')" "$(_ha_state_get '."best-delay"' '"—"')"
     printf '最近判断：%s\n' "$(_ha_state_get '."last-reason"' '"尚未检测"')"
     printf '检测时间：%s\n' "$(_ha_state_get '."checked-at"' '"—"')"
+    _ha_codex_status
     if "$BIN_YQ" -e '.lan.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1; then
         printf '局域网代理：http://%s:%s\n' "$(_ha_get '.lan.server' '""')" "$(_ha_get '.lan.port' '7890')"
         printf '客户端订阅：http://%s:%s/sub/%s\n' "$(_ha_get '.lan.server' '""')" "$(_ha_get '.lan."subscription-port"' '8088')" "$(_ha_get '.lan."subscription-token"' '""')"
@@ -573,6 +842,37 @@ clashha() {
         "$BIN_YQ" -i '.mode = "pin"' "$CLASH_HA_CONFIG"
         ;;
     unpin) "$BIN_YQ" -i '.mode = "auto"' "$CLASH_HA_CONFIG"; _okcat "已解除严格固定" ;;
+    codex)
+        case "${2:-status}" in
+        enable)
+            "$BIN_YQ" -i '.codex.enabled = true' "$CLASH_HA_CONFIG"
+            /usr/bin/rm -f "$CLASH_HA_CODEX_STATE"
+            _ha_build_and_restart || { "$BIN_YQ" -i '.codex.enabled = false' "$CLASH_HA_CONFIG"; return 1; }
+            _ha_install_daemon
+            _ha_codex_check_once
+            _ha_codex_status
+            ;;
+        disable)
+            "$BIN_YQ" -i '.codex.enabled = false' "$CLASH_HA_CONFIG"
+            /usr/bin/rm -f "$CLASH_HA_CODEX_STATE"
+            _ha_build_and_restart
+            ;;
+        check) _ha_codex_check_once && _ha_codex_status ;;
+        auto)
+            _ha_codex_enabled || { _errorcat "Codex HA 未启用"; return 1; }
+            _node_apply "$(_ha_get '.codex.group' '"CODEX"')" "$(_ha_get '.codex.auto-group' '"CODEX-HA"')" || return 1
+            /usr/bin/rm -f "$CLASH_HA_CODEX_STATE"
+            _ha_codex_check_once
+            ;;
+        pin)
+            _ha_codex_enabled || { _errorcat "Codex HA 未启用"; return 1; }
+            [ -n "${3:-}" ] || { _errorcat "用法：clashctl ha codex pin <节点全名>"; return 1; }
+            _node_apply "$(_ha_get '.codex.group' '"CODEX"')" "$3"
+            ;;
+        status) _ha_codex_status ;;
+        *) _errorcat "用法：clashctl ha codex enable|disable|check|status|auto|pin <节点全名>" ;;
+        esac
+        ;;
     lan)
         case "${2:-}" in
         enable) _ha_lan_enable "${3:-}" "${4:-}" "${5:-}" ;;
@@ -600,6 +900,12 @@ clashctl ha - 多订阅高可用
   resume                  恢复自动优选
   pin <节点全名>          严格固定节点，故障也不切换
   unpin                   解除严格固定
+  codex enable            启用 OpenAI/Codex 独立高可用组
+  codex disable           停用 OpenAI/Codex 独立高可用组
+  codex check             立即执行 OpenAI 双目标检测
+  codex status            查看 OpenAI/Codex 组状态
+  codex auto              在 Web UI 固定节点后恢复自动模式
+  codex pin <节点全名>    固定 OpenAI/Codex 节点，完全停止自动切换
   lan enable [CIDR] [用户] [地址] 开启局域网代理和客户端订阅
   lan disable             关闭局域网入口
   log [-n 行数]           查看 HA 日志

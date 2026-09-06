@@ -17,6 +17,28 @@ region-preference:
     - japan
     - hong-kong
     - other
+codex:
+  enabled: false
+  group: CODEX
+  auto-group: CODEX-HA
+  check-url: https://chatgpt.com/robots.txt
+  check-expected-status: 200
+  confirm-url: https://api.openai.com/v1/models
+  confirm-expected-status: 401
+  interval: 120
+  timeout: 8000
+  absolute-improvement: 150
+  relative-improvement: 30
+  performance-confirmations: 3
+  failure-confirmations: 2
+  cooldown: 1800
+  protect-active-connections: true
+  domains:
+    - chatgpt.com
+    - openai.com
+    - oaistatic.com
+    - oaiusercontent.com
+    - oaisidekickupdates.blob.core.windows.net
 last-recovery: 0
 mode: auto
 hold-until: 0

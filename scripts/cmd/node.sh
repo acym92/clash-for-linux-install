@@ -867,8 +867,9 @@ _node_delay_member_rows() {
     local url=$1 timeout=$2
     shift 2
     local members=("$@") name
-    local qs concurrency active=0
+    local qs concurrency active=0 expected=${CLASHCTL_NODE_EXPECTED_STATUS:-}
     qs="timeout=${timeout}&url=$(_node_urlencode "$url")"
+    [ -z "$expected" ] || qs="${qs}&expected=$(_node_urlencode "$expected")"
     concurrency=${CLASHCTL_NODE_DELAY_CONCURRENCY:-8}
     [[ "$concurrency" =~ ^[0-9]+$ ]] || concurrency=8
     ((concurrency < 1)) && concurrency=1
@@ -890,9 +891,10 @@ _node_delay_rows() {
     local group=$1 url=$2 timeout=$3
     shift 3
     local members=("$@")
-    local enc qs resp code body name delay
+    local enc qs resp code body name delay expected=${CLASHCTL_NODE_EXPECTED_STATUS:-}
     enc=$(_node_urlencode "$group")
     qs="timeout=${timeout}&url=$(_node_urlencode "$url")"
+    [ -z "$expected" ] || qs="${qs}&expected=$(_node_urlencode "$expected")"
     resp=$(_node_curl GET "/group/$enc/delay?$qs" -w $'\n%{http_code}')
     code=${resp##*$'\n'}
     body=${resp%$'\n'*}

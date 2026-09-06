@@ -35,4 +35,14 @@ _ha_build_config
 [ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "PROXY") | .proxies' "$_HA_BUILD_FILE")" = '["HA-AUTO"]' ]
 [ "$("$BIN_YQ" -o=json -I=0 '.rules' "$_HA_BUILD_FILE")" = '["MATCH,PROXY"]' ]
 
+codex_config="$test_dir/ha-codex.yaml"
+"$BIN_YQ" '.codex.enabled = true' "$root/resources/ha.yaml" >"$codex_config"
+CLASH_HA_CONFIG=$codex_config
+_ha_build_config
+[ "$_HA_BUILD_COUNT" -eq 2 ]
+[ "$("$BIN_YQ" '.proxy-groups[] | select(.name == "CODEX-HA") | .proxies | length' "$_HA_BUILD_FILE")" = 2 ]
+[ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "CODEX") | .proxies' "$_HA_BUILD_FILE")" = '["CODEX-HA","[A] node-one","[B] node-two"]' ]
+[ "$("$BIN_YQ" -o=json -I=0 '.rules | .[0:5]' "$_HA_BUILD_FILE")" = '["DOMAIN-SUFFIX,chatgpt.com,CODEX","DOMAIN-SUFFIX,openai.com,CODEX","DOMAIN-SUFFIX,oaistatic.com,CODEX","DOMAIN-SUFFIX,oaiusercontent.com,CODEX","DOMAIN-SUFFIX,oaisidekickupdates.blob.core.windows.net,CODEX"]' ]
+[ "$("$BIN_YQ" '.rules[-1]' "$_HA_BUILD_FILE")" = 'MATCH,PROXY' ]
+
 printf 'HA config smoke test passed\n'
