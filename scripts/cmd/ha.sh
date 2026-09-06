@@ -181,6 +181,10 @@ _ha_mode_allows_failure_switch() {
     [ "$1" != pin ]
 }
 
+_ha_same_region() {
+    [ "$(_ha_region_key "$1")" = "$(_ha_region_key "$2")" ]
+}
+
 # 从有效的 name<TAB>delay 行中选择候选。地区偏好只在最快延迟加容差的
 # 范围内生效，因此偏好地区的慢节点不会压过明显更快的其他地区节点。
 _ha_select_best() {
@@ -234,7 +238,7 @@ _ha_check_once() {
     [ ${#members[@]} -gt 0 ] || return 1
 
     region_enabled=$(_ha_get '.region-preference.enabled' 'true')
-    region_tolerance=$(_ha_get '.region-preference.tolerance' '50')
+    region_tolerance=$(_ha_get '.region-preference.tolerance' '100')
     region_order=$(_ha_get '(.region-preference.order // ["taiwan", "japan", "hong-kong", "other"]) | join(",")' '"taiwan,japan,hong-kong,other"')
     delay_rows=$(_node_delay_rows "$group" "$url" "$timeout" "${members[@]}")
     while IFS=$'\t' read -r name delay; do
@@ -299,7 +303,13 @@ _ha_check_once() {
                 switch_kind=region
             fi
             if { [ "$region_preferred" = true ] || [ "$improvement" -ge "$required" ]; } && [ $((now - last_switch)) -ge "$cooldown" ]; then
-                if [ "$candidate" = "$best" ]; then candidate_count=$((candidate_count + 1)); else candidate=$best; candidate_count=1; fi
+                if [ "$candidate" = "$best" ] || { [ "$switch_kind" = region ] && [ -n "$candidate" ] && _ha_same_region "$candidate" "$best"; }; then
+                    candidate=$best
+                    candidate_count=$((candidate_count + 1))
+                else
+                    candidate=$best
+                    candidate_count=1
+                fi
                 if [ "$switch_kind" = region ]; then
                     reason="地区优先候选（相差 ${improvement#-}ms），确认 ${candidate_count}/${confirmations}"
                 else

@@ -6,14 +6,16 @@ export CLASHCTL_HOME=$root
 . "$root/scripts/cmd/clashctl.sh"
 
 order=taiwan,japan,hong-kong,other
-rows=$'[S] other\t50\n[S] 香港 01\t60\n[S] 日本 01\t70\n[S] 台湾 01\t100'
+rows=$'[S] other\t50\n[S] 香港 01\t60\n[S] 日本 01\t70\n[S] 台湾 01\t150'
 
-[ "$(_ha_select_best 50 "$order" true <<<"$rows")" = $'[S] 台湾 01\t100' ]
-[ "$(_ha_select_best 49 "$order" true <<<"$rows")" = $'[S] 日本 01\t70' ]
-[ "$(_ha_select_best 50 "$order" false <<<"$rows")" = $'[S] other\t50' ]
+[ "$(_ha_select_best 100 "$order" true <<<"$rows")" = $'[S] 台湾 01\t150' ]
+[ "$(_ha_select_best 99 "$order" true <<<"$rows")" = $'[S] 日本 01\t70' ]
+[ "$(_ha_select_best 100 "$order" false <<<"$rows")" = $'[S] other\t50' ]
 [ "$(_ha_region_key '[A] 🇹🇼 台北')" = taiwan ]
 [ "$(_ha_region_key '[A] JP-TCP-01')" = japan ]
 [ "$(_ha_region_key '[A] HK-01')" = hong-kong ]
+_ha_same_region '[A] 台湾 01' '[B] 🇹🇼 台北 02'
+! _ha_same_region '[A] 台湾 01' '[B] 日本 01'
 _ha_mode_allows_performance_switch auto
 ! _ha_mode_allows_performance_switch hold
 ! _ha_mode_allows_performance_switch pin

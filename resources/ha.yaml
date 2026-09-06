@@ -11,7 +11,7 @@ failure-confirmations: 2
 cooldown: 600
 region-preference:
   enabled: true
-  tolerance: 50
+  tolerance: 100
   order:
     - taiwan
     - japan
