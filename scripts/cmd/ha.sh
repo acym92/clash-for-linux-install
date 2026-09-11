@@ -107,14 +107,12 @@ _ha_build_config() {
     if [ "$codex_mode" = fixed ] && [ -n "$codex_pinned" ] && PINNED=$codex_pinned "$BIN_YQ" -e 'map(select(.name == strenv(PINNED))) | length > 0' "$nodes" >/dev/null 2>&1; then
         codex_first=$codex_pinned
     fi
-    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains "$BIN_YQ" eval-all '
-      select(fileIndex == 0) as $config |
-      select(fileIndex == 1) as $nodes |
+    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
+      load(strenv(NODES_FILE)) as $nodes |
       strenv(HA_GROUP) as $ha |
       strenv(CODEX_GROUP) as $codex |
       strenv(CODEX_AUTO_GROUP) as $codexAuto |
       (strenv(CODEX_ENABLED) == "true") as $codexEnabled |
-      $config |
       .profile."store-selected" = true |
       .proxies = $nodes |
       (.proxy-groups // []) as $old |
@@ -132,7 +130,7 @@ _ha_build_config() {
         (($rules | select(length > 0)) // ["MATCH," + $ha]) as $baseRules |
         ((((strenv(CODEX_DOMAINS) | split(",") | map("DOMAIN-SUFFIX," + . + "," + $codex)) + $baseRules)
           | select($codexEnabled)) // $baseRules))
-    ' "$template_path" "$nodes" >"$work"
+    ' "$template_path" >"$work"
     /usr/bin/rm -f "$nodes" "$part"
 
     _valid_config "$work" || {
