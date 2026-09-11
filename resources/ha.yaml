@@ -17,6 +17,8 @@ region-preference:
     - japan
     - hong-kong
     - other
+ha-domains:
+  - ws.okx.com
 codex:
   enabled: false
   mode: auto

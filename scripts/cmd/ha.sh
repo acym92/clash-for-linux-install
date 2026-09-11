@@ -47,7 +47,7 @@ _ha_build_config() {
         return 1
     }
 
-    local template_name template_path group codex_enabled codex_group codex_auto_group codex_domains codex_mode codex_pinned codex_first nodes part work name path count=0
+    local template_name template_path group ha_domains codex_enabled codex_group codex_auto_group codex_domains codex_mode codex_pinned codex_first nodes part work name path count=0
     template_name=$(_sub_current)
     [ -n "$template_name" ] || template_name=$(_sub_names | head -n1)
     [ -n "$template_name" ] || {
@@ -61,6 +61,7 @@ _ha_build_config() {
     }
 
     group=$(_ha_get '.group' '"HA-AUTO"')
+    ha_domains=$(_ha_get '(.ha-domains // []) | join(",")' '""')
     codex_enabled=$(_ha_get '.codex.enabled' 'false')
     codex_group=$(_ha_get '.codex.group' '"CODEX"')
     codex_auto_group=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
@@ -107,7 +108,7 @@ _ha_build_config() {
     if [ "$codex_mode" = fixed ] && [ -n "$codex_pinned" ] && PINNED=$codex_pinned "$BIN_YQ" -e 'map(select(.name == strenv(PINNED))) | length > 0' "$nodes" >/dev/null 2>&1; then
         codex_first=$codex_pinned
     fi
-    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
+    HA_GROUP=$group HA_DOMAINS=$ha_domains CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
       load(strenv(NODES_FILE)) as $nodes |
       strenv(HA_GROUP) as $ha |
       strenv(CODEX_GROUP) as $codex |
@@ -129,8 +130,9 @@ _ha_build_config() {
       .listeners = ((.listeners // []) | map(select(.name != "codex-ha-probe"))) |
       .rules = ((.rules // []) as $rules |
         (($rules | select(length > 0)) // ["MATCH," + $ha]) as $baseRules |
-        ((((strenv(CODEX_DOMAINS) | split(",") | map("DOMAIN-SUFFIX," + . + "," + $codex)) + $baseRules)
-          | select($codexEnabled)) // $baseRules))
+        (strenv(HA_DOMAINS) | split(",") | map(select(length > 0) | "DOMAIN," + . + "," + $ha)) as $haRules |
+        ((((strenv(CODEX_DOMAINS) | split(",") | map("DOMAIN-SUFFIX," + . + "," + $codex)) + $haRules + $baseRules)
+          | select($codexEnabled)) // ($haRules + $baseRules)))
     ' "$template_path" >"$work"
     /usr/bin/rm -f "$nodes" "$part"
 
@@ -864,7 +866,7 @@ _ha_client_config() {
          "DOMAIN-SUFFIX,netease.com,DIRECT", "DOMAIN-SUFFIX,baidu.com,DIRECT",
          "DOMAIN-SUFFIX,gitee.com,DIRECT", "DOMAIN-SUFFIX,taobao.com,DIRECT",
          "DOMAIN-SUFFIX,youdao.com,DIRECT", "DOMAIN-SUFFIX,ugnas.com,DIRECT",
-         "DOMAIN-SUFFIX,ug.link,DIRECT", "MATCH,PROXY"]}
+         "DOMAIN-SUFFIX,ug.link,DIRECT", "DOMAIN,ws.okx.com,PROXY", "MATCH,PROXY"]}
     ' >"$CLASH_HA_CLIENT_CONFIG"
     chmod 600 "$CLASH_HA_CLIENT_CONFIG"
 }
