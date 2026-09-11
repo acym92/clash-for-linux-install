@@ -739,8 +739,17 @@ _ha_client_config() {
        "proxies": [{"name": "LAN-HA", "type": "http", "server": strenv(LAN_SERVER),
          "port": (env(LAN_PORT) | tonumber), "username": strenv(LAN_USER), "password": strenv(LAN_PASSWORD)}],
        "proxy-groups": [{"name": "PROXY", "type": "select", "proxies": ["LAN-HA"]}],
-       "rules": ["IP-CIDR,10.0.0.0/8,DIRECT,no-resolve", "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
-         "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve", "MATCH,PROXY"]}
+       "rules": ["DOMAIN,localhost,DIRECT", "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+         "IP-CIDR6,::1/128,DIRECT,no-resolve", "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+         "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve", "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+         "DOMAIN-SUFFIX,qq.com,DIRECT", "DOMAIN-SUFFIX,bilibili.com,DIRECT",
+         "DOMAIN-SUFFIX,aliyun.com,DIRECT", "DOMAIN-SUFFIX,deepseek.com,DIRECT",
+         "DOMAIN-SUFFIX,feishu.com,DIRECT", "DOMAIN-SUFFIX,163.com,DIRECT",
+         "DOMAIN-SUFFIX,battle.net,DIRECT", "DOMAIN-SUFFIX,battlenet.com.cn,DIRECT",
+         "DOMAIN-SUFFIX,blizzard.com,DIRECT", "DOMAIN,blizzard.gcdn.cloudn.co.kr,DIRECT",
+         "DOMAIN-SUFFIX,netease.com,DIRECT", "DOMAIN-SUFFIX,baidu.com,DIRECT",
+         "DOMAIN-SUFFIX,gitee.com,DIRECT", "DOMAIN-SUFFIX,taobao.com,DIRECT",
+         "DOMAIN-SUFFIX,youdao.com,DIRECT", "DOMAIN-SUFFIX,ugnas.com,DIRECT", "MATCH,PROXY"]}
     ' >"$CLASH_HA_CLIENT_CONFIG"
     chmod 600 "$CLASH_HA_CLIENT_CONFIG"
 }

@@ -17,6 +17,26 @@ authentication:
 # 示例：https://github.com/nelvko/clash-for-linux-install/discussions/562
 rules:
   prepend:
+    - DOMAIN,localhost,DIRECT
+    - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve
+    - IP-CIDR6,::1/128,DIRECT,no-resolve
+    - IP-CIDR,192.168.31.0/24,DIRECT,no-resolve
+    - DOMAIN-SUFFIX,qq.com,DIRECT
+    - DOMAIN-SUFFIX,bilibili.com,DIRECT
+    - DOMAIN-SUFFIX,aliyun.com,DIRECT
+    - DOMAIN-SUFFIX,deepseek.com,DIRECT
+    - DOMAIN-SUFFIX,feishu.com,DIRECT
+    - DOMAIN-SUFFIX,163.com,DIRECT
+    - DOMAIN-SUFFIX,battle.net,DIRECT
+    - DOMAIN-SUFFIX,battlenet.com.cn,DIRECT
+    - DOMAIN-SUFFIX,blizzard.com,DIRECT
+    - DOMAIN,blizzard.gcdn.cloudn.co.kr,DIRECT
+    - DOMAIN-SUFFIX,netease.com,DIRECT
+    - DOMAIN-SUFFIX,baidu.com,DIRECT
+    - DOMAIN-SUFFIX,gitee.com,DIRECT
+    - DOMAIN-SUFFIX,taobao.com,DIRECT
+    - DOMAIN-SUFFIX,youdao.com,DIRECT
+    - DOMAIN-SUFFIX,ugnas.com,DIRECT
     - DOMAIN,api64.ipify.org,DIRECT # 用于 clashui 获取真实公网 IP
     # - DOMAIN-KEYWORD,github,proxy   # 用于 clashupgrade 升级内核
   append:
@@ -46,4 +66,3 @@ tun:
   strict-route: true
   exclude-src-port: # 排除源端口，避免无法访问容器内服务 https://github.com/nelvko/clash-for-linux-install/issues/100#issuecomment-2995667368
     # - 80
-
