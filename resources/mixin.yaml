@@ -26,6 +26,7 @@ rules:
     - DOMAIN-SUFFIX,aliyun.com,DIRECT
     - DOMAIN-SUFFIX,deepseek.com,DIRECT
     - DOMAIN-SUFFIX,feishu.com,DIRECT
+    - DOMAIN-SUFFIX,feishu.cn,DIRECT
     - DOMAIN-SUFFIX,163.com,DIRECT
     - DOMAIN-SUFFIX,battle.net,DIRECT
     - DOMAIN-SUFFIX,battlenet.com.cn,DIRECT
