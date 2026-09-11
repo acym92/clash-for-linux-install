@@ -37,6 +37,7 @@ rules:
     - DOMAIN-SUFFIX,taobao.com,DIRECT
     - DOMAIN-SUFFIX,youdao.com,DIRECT
     - DOMAIN-SUFFIX,ugnas.com,DIRECT
+    - DOMAIN-SUFFIX,ug.link,DIRECT
     - DOMAIN,api64.ipify.org,DIRECT # 用于 clashui 获取真实公网 IP
     # - DOMAIN-KEYWORD,github,proxy   # 用于 clashupgrade 升级内核
   append:

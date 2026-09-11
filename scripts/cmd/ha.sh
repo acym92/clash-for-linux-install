@@ -862,7 +862,8 @@ _ha_client_config() {
          "DOMAIN-SUFFIX,blizzard.com,DIRECT", "DOMAIN,blizzard.gcdn.cloudn.co.kr,DIRECT",
          "DOMAIN-SUFFIX,netease.com,DIRECT", "DOMAIN-SUFFIX,baidu.com,DIRECT",
          "DOMAIN-SUFFIX,gitee.com,DIRECT", "DOMAIN-SUFFIX,taobao.com,DIRECT",
-         "DOMAIN-SUFFIX,youdao.com,DIRECT", "DOMAIN-SUFFIX,ugnas.com,DIRECT", "MATCH,PROXY"]}
+         "DOMAIN-SUFFIX,youdao.com,DIRECT", "DOMAIN-SUFFIX,ugnas.com,DIRECT",
+         "DOMAIN-SUFFIX,ug.link,DIRECT", "MATCH,PROXY"]}
     ' >"$CLASH_HA_CLIENT_CONFIG"
     chmod 600 "$CLASH_HA_CLIENT_CONFIG"
 }
