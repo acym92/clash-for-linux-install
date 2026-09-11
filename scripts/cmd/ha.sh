@@ -796,18 +796,27 @@ _ha_install_daemon() {
         } >"$unit"
         systemctl daemon-reload && systemctl enable --now clashctl-ha.service
     else
-        (
-            local launch_lock="${CLASH_HA_PID}.launch.lock" pid
-            local runner=()
-            exec 8>"$launch_lock"
-            /usr/bin/flock -n 8 || exit 0
-            if [ -f "$CLASH_HA_PID" ]; then
-                pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
-                [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && exit 0
-            fi
-            command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
-            nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
-        )
+        local attempt i pid
+        for attempt in 1 2; do
+            (
+                local launch_lock="${CLASH_HA_PID}.launch.lock"
+                local runner=()
+                exec 8>"$launch_lock"
+                /usr/bin/flock -n 8 || exit 0
+                if [ -f "$CLASH_HA_PID" ]; then
+                    pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
+                    [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && exit 0
+                fi
+                command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
+                nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
+            )
+            for ((i = 0; i < 30; i++)); do
+                [ -f "$CLASH_HA_PID" ] && pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
+                [ -n "${pid:-}" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && return 0
+                sleep 0.1
+            done
+        done
+        return 1
     fi
 }
 
