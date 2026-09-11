@@ -23,9 +23,6 @@ codex:
   pinned-node: ""
   group: CODEX
   auto-group: CODEX-HA
-  probe-group: CODEX-PROBE
-  probe-listener: codex-ha-probe
-  probe-port: 19099
   probe-limit: 24
   check-url: https://chatgpt.com/backend-api/codex/responses
   check-expected-status: 405
