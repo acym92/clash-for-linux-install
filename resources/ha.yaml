@@ -23,8 +23,12 @@ codex:
   pinned-node: ""
   group: CODEX
   auto-group: CODEX-HA
-  check-url: https://chatgpt.com/robots.txt
-  check-expected-status: 200
+  probe-group: CODEX-PROBE
+  probe-listener: codex-ha-probe
+  probe-port: 19099
+  probe-limit: 24
+  check-url: https://chatgpt.com/backend-api/codex/responses
+  check-expected-status: 405
   confirm-url: https://api.openai.com/v1/models
   confirm-expected-status: 401
   interval: 120

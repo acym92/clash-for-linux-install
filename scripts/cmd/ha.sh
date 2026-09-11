@@ -47,7 +47,7 @@ _ha_build_config() {
         return 1
     }
 
-    local template_name template_path group codex_enabled codex_group codex_auto_group codex_domains codex_mode codex_pinned codex_first nodes part work name path count=0
+    local template_name template_path group codex_enabled codex_group codex_auto_group codex_probe_group codex_probe_listener codex_probe_port codex_domains codex_mode codex_pinned codex_first nodes part work name path count=0
     template_name=$(_sub_current)
     [ -n "$template_name" ] || template_name=$(_sub_names | head -n1)
     [ -n "$template_name" ] || {
@@ -64,6 +64,9 @@ _ha_build_config() {
     codex_enabled=$(_ha_get '.codex.enabled' 'false')
     codex_group=$(_ha_get '.codex.group' '"CODEX"')
     codex_auto_group=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
+    codex_probe_group=$(_ha_get '.codex.probe-group' '"CODEX-PROBE"')
+    codex_probe_listener=$(_ha_get '.codex.probe-listener' '"codex-ha-probe"')
+    codex_probe_port=$(_ha_get '.codex.probe-port' '19099')
     codex_mode=$(_ha_get '.codex.mode' '"auto"')
     codex_pinned=$(_ha_get '.codex."pinned-node"' '""')
     codex_domains=$(_ha_get '(.codex.domains // ["chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com"]) | join(",")' '"chatgpt.com,openai.com,oaistatic.com,oaiusercontent.com"')
@@ -107,24 +110,33 @@ _ha_build_config() {
     if [ "$codex_mode" = fixed ] && [ -n "$codex_pinned" ] && PINNED=$codex_pinned "$BIN_YQ" -e 'map(select(.name == strenv(PINNED))) | length > 0' "$nodes" >/dev/null 2>&1; then
         codex_first=$codex_pinned
     fi
-    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
+    HA_GROUP=$group CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_PROBE_GROUP=$codex_probe_group CODEX_PROBE_LISTENER=$codex_probe_listener CODEX_PROBE_PORT=$codex_probe_port CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
       load(strenv(NODES_FILE)) as $nodes |
       strenv(HA_GROUP) as $ha |
       strenv(CODEX_GROUP) as $codex |
       strenv(CODEX_AUTO_GROUP) as $codexAuto |
+      strenv(CODEX_PROBE_GROUP) as $codexProbe |
+      strenv(CODEX_PROBE_LISTENER) as $codexProbeListener |
       (strenv(CODEX_ENABLED) == "true") as $codexEnabled |
       .profile."store-selected" = true |
       .proxies = $nodes |
       (.proxy-groups // []) as $old |
       .proxy-groups = (
-        ($old | map(select(.name != $ha and .name != $codex and .name != $codexAuto) |
+        ($old | map(select(.name != $ha and .name != $codex and .name != $codexAuto and .name != $codexProbe) |
           {"name": .name, "type": "select", "proxies": [$ha]})) +
         [{"name": $ha, "type": "select", "proxies": ($nodes | map(.name))}] +
         ((
           [{"name": $codex, "type": "select", "proxies": ([strenv(CODEX_FIRST)] + (([$codexAuto] + ($nodes | map(.name))) | map(select(. != strenv(CODEX_FIRST)))))},
-           {"name": $codexAuto, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))}]
+           {"name": $codexAuto, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))},
+           {"name": $codexProbe, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))}]
           | select($codexEnabled)
         ) // [])
+      ) |
+      (.listeners // []) as $oldListeners |
+      .listeners = (
+        ($oldListeners | map(select(.name != $codexProbeListener))) +
+        (([{"name": $codexProbeListener, "type": "http", "listen": "127.0.0.1", "port": (env(CODEX_PROBE_PORT) | tonumber), "proxy": $codexProbe}]
+          | select($codexEnabled)) // [])
       ) |
       .rules = ((.rules // []) as $rules |
         (($rules | select(length > 0)) // ["MATCH," + $ha]) as $baseRules |
@@ -285,26 +297,49 @@ _ha_codex_record_switch() {
       '."last-switch" = (env(SWITCH_AT) | tonumber) | ."last-reason" = strenv(SWITCH_REASON)' "$CLASH_HA_CODEX_STATE"
 }
 
-# Only nodes that can reach both ChatGPT and the OpenAI authentication edge are
-# eligible for CODEX-HA. The slower result is used as the service latency score.
+# Probe through a local listener bound to the hidden CODEX-PROBE selector. This
+# verifies the real HTTP status without disturbing traffic through CODEX-HA.
+_ha_codex_http_status_ok() {
+    local port=$1 url=$2 expected=$3 timeout_ms=$4 code timeout_sec
+    timeout_sec=$(( (timeout_ms + 999) / 1000 ))
+    code=$(curl -sS -o /dev/null -w '%{http_code}' --proxy "http://127.0.0.1:${port}" \
+        --connect-timeout "$timeout_sec" --max-time "$timeout_sec" \
+        -H 'Connection: close' "$url" 2>/dev/null) || return 1
+    [ "$code" = "$expected" ]
+}
+
+# The delay API is used only to create a bounded shortlist. Each shortlisted
+# node must then return the configured statuses through the dedicated listener.
 _ha_codex_healthy_rows() {
-    local group=$1 check_url=$2 check_expected=$3 confirm_url=$4 confirm_expected=$5 timeout=$6
-    shift 6
-    local members=("$@") primary_rows confirm_rows name delay other
-    declare -A primary=() confirmed=()
-    primary_rows=$(CLASHCTL_NODE_EXPECTED_STATUS=$check_expected _node_delay_rows "$group" "$check_url" "$timeout" "${members[@]}")
-    confirm_rows=$(CLASHCTL_NODE_EXPECTED_STATUS=$confirm_expected _node_delay_rows "$group" "$confirm_url" "$timeout" "${members[@]}")
+    local group=$1 current=$2 check_url=$3 check_expected=$4 confirm_url=$5 confirm_expected=$6 timeout=$7
+    shift 7
+    local members=("$@") latency_rows probe_group probe_port probe_limit name delay selected=false
+    local shortlist=()
+    probe_group=$(_ha_get '.codex.probe-group' '"CODEX-PROBE"')
+    probe_port=$(_ha_get '.codex.probe-port' '19099')
+    probe_limit=$(_ha_get '.codex.probe-limit' '24')
+    [[ "$probe_limit" =~ ^[0-9]+$ ]] || probe_limit=24
+    latency_rows=$(_node_delay_rows "$group" "$confirm_url" "$timeout" "${members[@]}")
     while IFS=$'\t' read -r name delay; do
-        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] && primary["$name"]=$delay
-    done <<<"$primary_rows"
-    while IFS=$'\t' read -r name delay; do
-        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] && confirmed["$name"]=$delay
-    done <<<"$confirm_rows"
-    for name in "${members[@]}"; do
-        delay=${primary["$name"]:-}
-        other=${confirmed["$name"]:-}
-        [ -n "$delay" ] && [ -n "$other" ] || continue
-        [ "$other" -le "$delay" ] || delay=$other
+        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] || continue
+        [[ "$name" == *剩余流量* || "$name" == *距离下次重置* || "$name" == *套餐到期* ]] && continue
+        shortlist+=("$name"$'\t'"$delay")
+        [ "${#shortlist[@]}" -ge "$probe_limit" ] && break
+    done < <(sort -t $'\t' -k2,2n <<<"$latency_rows")
+    for name in "${shortlist[@]}"; do
+        [ "${name%%$'\t'*}" = "$current" ] && selected=true
+    done
+    if [ "$selected" = false ]; then
+        delay=$(awk -F '\t' -v node="$current" '$1 == node {print $2; exit}' <<<"$latency_rows")
+        [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] && shortlist+=("$current"$'\t'"$delay")
+    fi
+    local row
+    for row in "${shortlist[@]}"; do
+        name=${row%%$'\t'*}
+        delay=${row##*$'\t'}
+        _node_apply "$probe_group" "$name" >/dev/null 2>&1 || continue
+        _ha_codex_http_status_ok "$probe_port" "$check_url" "$check_expected" "$timeout" || continue
+        _ha_codex_http_status_ok "$probe_port" "$confirm_url" "$confirm_expected" "$timeout" || continue
         printf '%s\t%s\n' "$name" "$delay"
     done
 }
@@ -366,7 +401,7 @@ _ha_codex_check_once() {
     region_enabled=$(_ha_get '.region-preference.enabled' 'true')
     region_tolerance=$(_ha_get '.region-preference.tolerance' '100')
     region_order=$(_ha_get '(.region-preference.order // ["taiwan", "japan", "hong-kong", "other"]) | join(",")' '"taiwan,japan,hong-kong,other"')
-    delay_rows=$(_ha_codex_healthy_rows "$group" "$check_url" "$check_expected" "$confirm_url" "$confirm_expected" "$timeout" "${members[@]}")
+    delay_rows=$(_ha_codex_healthy_rows "$group" "$current" "$check_url" "$check_expected" "$confirm_url" "$confirm_expected" "$timeout" "${members[@]}")
     while IFS=$'\t' read -r name delay; do
         [ "$name" = "$current" ] && current_delay=$delay
     done <<<"$delay_rows"
