@@ -636,7 +636,7 @@ _ha_daemon() {
         _errorcat "HA 调度器已运行"
         return 1
     }
-    if [ -f "$CLASH_HA_PID" ] && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" != "$$" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
+    if [ -f "$CLASH_HA_PID" ] && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" != "$$" ] && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" != "$PPID" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
         _errorcat "HA 调度器已运行"
         return 1
     fi
