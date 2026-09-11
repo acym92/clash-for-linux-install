@@ -698,7 +698,6 @@ _ha_install_daemon() {
             fi
             command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
             nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
-            printf '%s\n' "$!" >"$CLASH_HA_PID"
         )
     fi
 }
