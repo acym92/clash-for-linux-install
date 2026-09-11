@@ -653,6 +653,112 @@ _ha_recover() {
     _ha_build_and_restart >>"$CLASH_HA_LOG" 2>&1 || _ha_log "ERROR 自动恢复重建失败"
 }
 
+_ha_sub_update_state_get() {
+    [ -f "$CLASH_HA_SUB_UPDATE_STATE" ] || {
+        "$BIN_YQ" -n "$2" 2>/dev/null
+        return
+    }
+    "$BIN_YQ" "$1 // $2" "$CLASH_HA_SUB_UPDATE_STATE" 2>/dev/null
+}
+
+_ha_sub_update_state_write() {
+    local last_attempt=$1 last_success=$2 next_attempt=$3 pending=$4 applied_fingerprint=$5 pending_fingerprint=$6 reason=$7
+    LAST_ATTEMPT=$last_attempt LAST_SUCCESS=$last_success NEXT_ATTEMPT=$next_attempt PENDING=$pending \
+      APPLIED_FINGERPRINT=$applied_fingerprint PENDING_FINGERPRINT=$pending_fingerprint REASON=$reason \
+      "$BIN_YQ" -n '
+        {"last-attempt": (env(LAST_ATTEMPT) | tonumber),
+         "last-success": (env(LAST_SUCCESS) | tonumber),
+         "next-attempt": (env(NEXT_ATTEMPT) | tonumber),
+         "pending": (env(PENDING) == "true"),
+         "applied-fingerprint": strenv(APPLIED_FINGERPRINT),
+         "pending-fingerprint": strenv(PENDING_FINGERPRINT),
+         "last-reason": strenv(REASON)}
+      ' >"${CLASH_HA_SUB_UPDATE_STATE}.new" && /bin/mv -f "${CLASH_HA_SUB_UPDATE_STATE}.new" "$CLASH_HA_SUB_UPDATE_STATE"
+}
+
+_ha_profiles_fingerprint() {
+    local name path
+    {
+        while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            path=$(_sub_get "$name" path)
+            [ -s "$path" ] || continue
+            printf '%s\t' "$name"
+            sha256sum "$path"
+        done < <(_sub_names)
+    } | sha256sum | awk '{print $1}'
+}
+
+_ha_active_connections() {
+    local response count
+    response=$(_node_curl GET '/connections') || { printf '1\n'; return; }
+    count=$("$BIN_YQ" -p=json '.connections | length' <<<"$response" 2>/dev/null)
+    [[ "$count" =~ ^[0-9]+$ ]] && printf '%s\n' "$count" || printf '1\n'
+}
+
+_ha_subscription_update_if_due() {
+    [ "$(_ha_get '.subscription-update.enabled' 'false')" = true ] || return 0
+    local now interval retry defer pending last_attempt last_success next_attempt applied_fingerprint pending_fingerprint
+    local before after reason active
+    now=$(date +%s)
+    interval=$(_ha_get '.subscription-update.interval' '21600')
+    retry=$(_ha_get '.subscription-update."retry-interval"' '900')
+    defer=$(_ha_get '.subscription-update."defer-when-active"' 'true')
+    [[ "$interval" =~ ^[0-9]+$ ]] || interval=21600
+    [[ "$retry" =~ ^[0-9]+$ ]] || retry=900
+    pending=$(_ha_sub_update_state_get '.pending' 'false')
+    last_attempt=$(_ha_sub_update_state_get '."last-attempt"' '0')
+    last_success=$(_ha_sub_update_state_get '."last-success"' '0')
+    next_attempt=$(_ha_sub_update_state_get '."next-attempt"' '0')
+    applied_fingerprint=$(_ha_sub_update_state_get '."applied-fingerprint"' '""')
+    pending_fingerprint=$(_ha_sub_update_state_get '."pending-fingerprint"' '""')
+    [ "$now" -ge "$next_attempt" ] || return 0
+    before=$(_ha_profiles_fingerprint)
+    [ -n "$applied_fingerprint" ] || applied_fingerprint=$before
+
+    if [ "$pending" != true ]; then
+        _ha_log "开始定时更新全部订阅"
+        last_attempt=$now
+        if ! _sub_update --all >>"$CLASH_HA_LOG" 2>&1; then
+            reason="订阅更新失败，${retry} 秒后重试"
+            _ha_log "WARN $reason"
+            _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) false "$applied_fingerprint" '' "$reason"
+            return 0
+        fi
+        after=$(_ha_profiles_fingerprint)
+        if [ "$after" = "$applied_fingerprint" ]; then
+            reason="订阅更新成功，内容无变化"
+            _ha_log "$reason"
+            _ha_sub_update_state_write "$last_attempt" "$now" $((now + interval)) false "$after" '' "$reason"
+            return 0
+        fi
+        pending=true
+        pending_fingerprint=$after
+    fi
+
+    if [ "$defer" = true ]; then
+        active=$(_ha_active_connections)
+        if [ "$active" -gt 0 ]; then
+            reason="订阅已有变化，检测到 ${active} 条活跃连接，${retry} 秒后再应用"
+            _ha_log "$reason"
+            _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) true "$applied_fingerprint" "$pending_fingerprint" "$reason"
+            return 0
+        fi
+    fi
+
+    if _ha_build_and_restart >>"$CLASH_HA_LOG" 2>&1; then
+        _ha_client_config
+        after=$(_ha_profiles_fingerprint)
+        reason="订阅更新已应用并重建 HA 节点池"
+        _ha_log "$reason"
+        _ha_sub_update_state_write "$last_attempt" "$now" $((now + interval)) false "$after" '' "$reason"
+    else
+        reason="订阅已更新但重建失败，${retry} 秒后重试"
+        _ha_log "ERROR $reason"
+        _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) true "$applied_fingerprint" "$pending_fingerprint" "$reason"
+    fi
+}
+
 _ha_daemon() {
     _ha_enabled || return 0
     local lock_file="${CLASH_HA_PID}.lock"
@@ -671,6 +777,7 @@ _ha_daemon() {
     while _ha_enabled && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" = "$$" ]; do
         _ha_check_once || _ha_log "WARN 本轮检测失败，等待内核/API 就绪"
         _ha_codex_check_if_due || _ha_log "WARN Codex 本轮检测失败，等待内核/API 就绪"
+        _ha_subscription_update_if_due || _ha_log "WARN 定时订阅更新任务异常"
         sleep "$(_ha_get '.interval' '30')" & wait $!
     done
 }
@@ -854,6 +961,22 @@ _ha_codex_status() {
     printf 'Codex 检测时间：%s\n' "$(_ha_codex_state_get '."checked-at"' '"—"')"
 }
 
+_ha_subscription_update_status() {
+    if [ "$(_ha_get '.subscription-update.enabled' 'false')" != true ]; then
+        printf '订阅定时更新：停用\n'
+        return 0
+    fi
+    local pending last_success next_attempt reason
+    pending=$(_ha_sub_update_state_get '.pending' 'false')
+    last_success=$(_ha_sub_update_state_get '."last-success"' '0')
+    next_attempt=$(_ha_sub_update_state_get '."next-attempt"' '0')
+    reason=$(_ha_sub_update_state_get '."last-reason"' '"尚未执行"')
+    printf '订阅定时更新：启用（每 %s 秒，待应用：%s）\n' "$(_ha_get '.subscription-update.interval' '21600')" "$pending"
+    printf '订阅上次成功：%s\n' "$last_success"
+    printf '订阅下次尝试：%s\n' "$next_attempt"
+    printf '订阅最近结果：%s\n' "$reason"
+}
+
 _ha_status() {
     printf 'HA：%s\n' "$(if _ha_enabled; then printf '启用'; else printf '停用'; fi)"
     if [ -f "$CLASH_HA_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
@@ -868,6 +991,7 @@ _ha_status() {
     printf '最近判断：%s\n' "$(_ha_state_get '."last-reason"' '"尚未检测"')"
     printf '检测时间：%s\n' "$(_ha_state_get '."checked-at"' '"—"')"
     _ha_codex_status
+    _ha_subscription_update_status
     if "$BIN_YQ" -e '.lan.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1; then
         printf '局域网代理：http://%s:%s\n' "$(_ha_get '.lan.server' '""')" "$(_ha_get '.lan.port' '7890')"
         printf '客户端订阅：http://%s:%s/sub/%s\n' "$(_ha_get '.lan.server' '""')" "$(_ha_get '.lan."subscription-port"' '8088')" "$(_ha_get '.lan."subscription-token"' '""')"

@@ -146,9 +146,16 @@ codex:
   failure-confirmations: 2
   cooldown: 1800
   protect-active-connections: true
+subscription-update:
+  enabled: true
+  interval: 21600
+  retry-interval: 900
+  defer-when-active: true
 ```
 
 修改后无需重建候选池，调度器下一轮会读取新值。修改 `group` 则必须执行 `clashctl ha refresh`。
+
+定时订阅更新默认每 6 小时执行一次，依次下载并校验全部订阅。内容没有变化时不会重启 Mihomo；内容变化但仍有活跃连接时会标记为待应用，并每 15 分钟检查一次，空闲后才重建 HA 节点池。下载、校验或重建失败时保留当前可用配置。运行 `clashctl ha status` 可以查看上次成功时间、下次尝试时间和待应用状态。
 
 地区偏好只在节点延迟不超过本轮最快节点 100ms 时生效；默认顺序是台湾、日本、香港、其他。同一地区仍选择延迟最低的节点。地区优先切换与普通性能切换一样，需要连续三轮确认并遵守冷却时间。设置 `region-preference.enabled: false` 可关闭地区偏好。
 

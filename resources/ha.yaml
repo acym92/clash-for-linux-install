@@ -42,6 +42,11 @@ codex:
     - oaistatic.com
     - oaiusercontent.com
     - oaisidekickupdates.blob.core.windows.net
+subscription-update:
+  enabled: true
+  interval: 21600
+  retry-interval: 900
+  defer-when-active: true
 last-recovery: 0
 mode: auto
 hold-until: 0
