@@ -832,6 +832,12 @@ _ha_stop_daemon() {
         _ha_pid_running "$pid" 'clashctl ha daemon' && kill -9 "$pid" 2>/dev/null || true
     fi
     /usr/bin/rm -f "$CLASH_HA_PID"
+    # The wrapper can outlive the daemon briefly while reaping its children.
+    # Wait until its flock is released so an immediate restart does not race.
+    for ((i = 0; i < 50; i++)); do
+        ( exec 7>"${CLASH_HA_PID}.lock"; /usr/bin/flock -n 7 ) && break
+        sleep 0.1
+    done
 }
 
 _ha_client_config() {
