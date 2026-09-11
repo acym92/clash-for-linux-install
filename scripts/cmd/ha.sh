@@ -664,13 +664,15 @@ _ha_install_daemon() {
     else
         (
             local launch_lock="${CLASH_HA_PID}.launch.lock" pid
+            local runner=()
             exec 8>"$launch_lock"
             /usr/bin/flock -n 8 || exit 0
             if [ -f "$CLASH_HA_PID" ]; then
                 pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
                 [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && exit 0
             fi
-            nohup env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
+            command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
+            nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
             printf '%s\n' "$!" >"$CLASH_HA_PID"
         )
     fi
