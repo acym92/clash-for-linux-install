@@ -5,6 +5,36 @@ __pycache__/
 
 config.yaml*
 
+# Generated runtime configuration and diagnostic snapshots
+resources/bootstrap.yaml
+resources/runtime.yaml
+resources/temp.yaml
+resources/last-failed.yaml
+resources/last-failed.raw
+resources/lan-client.yaml
+
+# Subscription caches and metadata produced at runtime
+resources/profiles/*.yaml
+!resources/profiles/.gitkeep
+resources/profiles.log
+resources/profiles.lock
+
+# HA runtime state, credentials, logs, and process files
+resources/ha-state.yaml
+resources/ha-codex-state.yaml
+resources/ha-sub-update-state.yaml
+resources/ha.log
+resources/ha.pid
+resources/ha.pid.lock
+resources/ha.pid.launch.lock
+resources/ha-sub.pid
+resources/ha-sub.token
+
+# Interrupted atomic writes may leave these temporary files behind
+resources/.fetch.*
+resources/.header.*
+resources/.ha-*
+
 archives/*
 !archives/dist.zip
 
