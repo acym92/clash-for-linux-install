@@ -47,7 +47,8 @@ _ha_build_config() {
         return 1
     }
 
-    local template_name template_path group ha_domains codex_enabled codex_group codex_auto_group codex_domains codex_mode codex_pinned codex_first nodes part work name path count=0
+    local template_name template_path group ha_domains codex_enabled codex_group codex_auto_group codex_domains codex_mode codex_pinned codex_first
+    local fallback_enabled fallback_local_group fallback_count nodes upstreams part work name path count=0
     template_name=$(_sub_current)
     [ -n "$template_name" ] || template_name=$(_sub_names | head -n1)
     [ -n "$template_name" ] || {
@@ -68,16 +69,32 @@ _ha_build_config() {
     codex_mode=$(_ha_get '.codex.mode' '"auto"')
     codex_pinned=$(_ha_get '.codex."pinned-node"' '""')
     codex_domains=$(_ha_get '(.codex.domains // ["chatgpt.com", "openai.com", "oaistatic.com", "oaiusercontent.com"]) | join(",")' '"chatgpt.com,openai.com,oaistatic.com,oaiusercontent.com"')
+    fallback_enabled=$(_ha_get '.fallback.enabled' 'false')
+    fallback_local_group=$(_ha_get '.fallback."local-group"' '"HA-LOCAL"')
     nodes=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-nodes.XXXXXX") || return 1
-    part=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-part.XXXXXX") || {
+    upstreams=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-upstreams.XXXXXX") || {
         /usr/bin/rm -f "$nodes"
         return 1
     }
+    part=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-part.XXXXXX") || {
+        /usr/bin/rm -f "$nodes" "$upstreams"
+        return 1
+    }
     work=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-config.XXXXXX") || {
-        /usr/bin/rm -f "$nodes" "$part"
+        /usr/bin/rm -f "$nodes" "$upstreams" "$part"
         return 1
     }
     printf '[]\n' >"$nodes"
+    "$BIN_YQ" '[.fallback.upstreams[]? |
+      select(.name != null and .name != "" and .server != null and .server != "" and .port != null) |
+      select(.type == "http" or .type == "socks5") |
+      .port = (.port | tonumber)]' "$CLASH_HA_CONFIG" >"$upstreams" || printf '[]\n' >"$upstreams"
+    fallback_count=$("$BIN_YQ" 'length' "$upstreams" 2>/dev/null)
+    if [ "$fallback_enabled" = true ] && [ "${fallback_count:-0}" -eq 0 ]; then
+        /usr/bin/rm -f "$nodes" "$upstreams" "$part" "$work"
+        _errorcat "外部备用已启用，但没有有效的 http/socks5 上游"
+        return 1
+    fi
 
     while IFS= read -r name; do
         [ -n "$name" ] || continue
@@ -99,7 +116,7 @@ _ha_build_config() {
     done < <(_sub_names)
 
     [ "$count" -gt 0 ] || {
-        /usr/bin/rm -f "$nodes" "$part" "$work"
+        /usr/bin/rm -f "$nodes" "$upstreams" "$part" "$work"
         _errorcat "所有订阅都没有可聚合的内联节点（proxy-providers 格式暂不支持）"
         return 1
     }
@@ -108,21 +125,29 @@ _ha_build_config() {
     if [ "$codex_mode" = fixed ] && [ -n "$codex_pinned" ] && PINNED=$codex_pinned "$BIN_YQ" -e 'map(select(.name == strenv(PINNED))) | length > 0' "$nodes" >/dev/null 2>&1; then
         codex_first=$codex_pinned
     fi
-    HA_GROUP=$group HA_DOMAINS=$ha_domains CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains NODES_FILE=$nodes "$BIN_YQ" '
+    HA_GROUP=$group HA_DOMAINS=$ha_domains CODEX_ENABLED=$codex_enabled CODEX_GROUP=$codex_group CODEX_AUTO_GROUP=$codex_auto_group CODEX_FIRST=$codex_first CODEX_DOMAINS=$codex_domains \
+      FALLBACK_ENABLED=$fallback_enabled FALLBACK_LOCAL_GROUP=$fallback_local_group NODES_FILE=$nodes FALLBACKS_FILE=$upstreams "$BIN_YQ" '
       load(strenv(NODES_FILE)) as $nodes |
+      load(strenv(FALLBACKS_FILE)) as $fallbacks |
       strenv(HA_GROUP) as $ha |
+      strenv(FALLBACK_LOCAL_GROUP) as $local |
       strenv(CODEX_GROUP) as $codex |
       strenv(CODEX_AUTO_GROUP) as $codexAuto |
       (strenv(CODEX_ENABLED) == "true") as $codexEnabled |
+      (strenv(FALLBACK_ENABLED) == "true") as $fallbackEnabled |
+      (($fallbacks | map(.name)) | select($fallbackEnabled) // []) as $fallbackNames |
       .profile."store-selected" = true |
-      .proxies = $nodes |
+      .proxies = ($nodes + (($fallbacks | select($fallbackEnabled)) // [])) |
       (.proxy-groups // []) as $old |
       .proxy-groups = (
-        ($old | map(select(.name != $ha and .name != $codex and .name != $codexAuto and .name != "CODEX-PROBE") |
+        ($old | map(select(.name != $ha and .name != $local and .name != $codex and .name != $codexAuto and .name != "CODEX-PROBE") |
           {"name": .name, "type": "select", "proxies": [$ha]})) +
-        [{"name": $ha, "type": "select", "proxies": ($nodes | map(.name))}] +
+        (([{"name": $ha, "type": "select", "proxies": ([$local] + $fallbackNames)},
+           {"name": $local, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))}]
+          | select($fallbackEnabled)) //
+         [{"name": $ha, "type": "select", "proxies": ($nodes | map(.name))}]) +
         ((
-          [{"name": $codex, "type": "select", "proxies": ([strenv(CODEX_FIRST)] + (([$codexAuto] + ($nodes | map(.name))) | map(select(. != strenv(CODEX_FIRST)))))},
+          [{"name": $codex, "type": "select", "proxies": ([strenv(CODEX_FIRST)] + (([$codexAuto] + ($nodes | map(.name)) + $fallbackNames) | map(select(. != strenv(CODEX_FIRST)))))},
            {"name": $codexAuto, "type": "select", "hidden": true, "proxies": ($nodes | map(.name))}]
           | select($codexEnabled)
         ) // [])
@@ -134,7 +159,7 @@ _ha_build_config() {
         ((((strenv(CODEX_DOMAINS) | split(",") | map("DOMAIN-SUFFIX," + . + "," + $codex)) + $haRules + $baseRules)
           | select($codexEnabled)) // ($haRules + $baseRules)))
     ' "$template_path" >"$work"
-    /usr/bin/rm -f "$nodes" "$part"
+    /usr/bin/rm -f "$nodes" "$upstreams" "$part"
 
     _valid_config "$work" || {
         /usr/bin/rm -f "$work"
@@ -165,16 +190,25 @@ _ha_build_and_restart() {
 
 _ha_write_state() {
     local now=$1 current=$2 current_delay=$3 best=$4 best_delay=$5 failures=$6 candidate=$7 candidate_count=$8 reason=$9
-    local last_switch
+    local last_switch route fallback_node fallback_since recovery_count fallback_codex_managed
     last_switch=$(_ha_state_get '."last-switch"' '0')
+    route=$(_ha_state_get '.route' '"local"')
+    fallback_node=$(_ha_state_get '."fallback-node"' '""')
+    fallback_since=$(_ha_state_get '."fallback-since"' '0')
+    recovery_count=$(_ha_state_get '."recovery-count"' '0')
+    fallback_codex_managed=$(_ha_state_get '."fallback-codex-managed"' 'false')
     CHECKED=$now CURRENT=$current CURRENT_DELAY=$current_delay BEST=$best BEST_DELAY=$best_delay \
       FAILURES=$failures CANDIDATE=$candidate CANDIDATE_COUNT=$candidate_count REASON=$reason LAST_SWITCH=$last_switch \
+      ROUTE=$route FALLBACK_NODE=$fallback_node FALLBACK_SINCE=$fallback_since RECOVERY_COUNT=$recovery_count FALLBACK_CODEX_MANAGED=$fallback_codex_managed \
       "$BIN_YQ" -n '
         {"checked-at": strenv(CHECKED), "current": strenv(CURRENT),
          "current-delay": strenv(CURRENT_DELAY), "best": strenv(BEST),
          "best-delay": strenv(BEST_DELAY), "failures": (env(FAILURES) | tonumber),
          "candidate": strenv(CANDIDATE), "candidate-count": (env(CANDIDATE_COUNT) | tonumber),
-         "last-reason": strenv(REASON), "last-switch": (env(LAST_SWITCH) | tonumber)}
+         "last-reason": strenv(REASON), "last-switch": (env(LAST_SWITCH) | tonumber),
+         "route": strenv(ROUTE), "fallback-node": strenv(FALLBACK_NODE),
+         "fallback-since": (env(FALLBACK_SINCE) | tonumber), "recovery-count": (env(RECOVERY_COUNT) | tonumber),
+         "fallback-codex-managed": (strenv(FALLBACK_CODEX_MANAGED) == "true")}
       ' >"${CLASH_HA_STATE}.new" && /bin/mv -f "${CLASH_HA_STATE}.new" "$CLASH_HA_STATE"
 }
 
@@ -219,6 +253,99 @@ _ha_mode_allows_failure_switch() {
 
 _ha_same_region() {
     [ "$(_ha_region_key "$1")" = "$(_ha_region_key "$2")" ]
+}
+
+_ha_fallback_enabled() {
+    [ "$(_ha_get '.fallback.enabled' 'false')" = true ] &&
+      [ "$(_ha_get '(.fallback.upstreams // []) | length' '0')" -gt 0 ]
+}
+
+_ha_local_group() {
+    if _ha_fallback_enabled; then
+        _ha_get '.fallback."local-group"' '"HA-LOCAL"'
+    else
+        _ha_get '.group' '"HA-AUTO"'
+    fi
+}
+
+_ha_fallback_is_node() {
+    local node=$1
+    [ -n "$node" ] || return 1
+    NODE=$node "$BIN_YQ" -e '.fallback.upstreams[]? | select(.name == strenv(NODE))' "$CLASH_HA_CONFIG" >/dev/null 2>&1
+}
+
+_ha_fallback_proxy_status_ok() {
+    local name=$1 url=$2 expected=$3 timeout_ms=$4 row type server port user password code timeout_sec
+    row=$(NAME=$name "$BIN_YQ" -r '.fallback.upstreams[]? | select(.name == strenv(NAME)) |
+      [.type, .server, (.port | tostring), (.username // ""), (.password // "")] | @tsv' "$CLASH_HA_CONFIG" 2>/dev/null | head -n1)
+    [ -n "$row" ] || return 1
+    IFS=$'\t' read -r type server port user password <<<"$row"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    timeout_sec=$(( (timeout_ms + 999) / 1000 ))
+    local args=(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout "$timeout_sec" --max-time "$timeout_sec" -H 'Connection: close')
+    case $type in
+    http) args+=(--proxy "http://${server}:${port}") ;;
+    socks5) args+=(--socks5-hostname "${server}:${port}") ;;
+    *) return 1 ;;
+    esac
+    [ -z "$user" ] && [ -z "$password" ] || args+=(--proxy-user "${user}:${password}")
+    code=$("${args[@]}" "$url" 2>/dev/null) || return 1
+    [ "$code" = "$expected" ]
+}
+
+_ha_fallback_choose() {
+    _ha_fallback_enabled || return 1
+    local check_url confirm_url check_expected confirm_expected timeout name
+    check_url=$(_ha_get '.fallback."check-url"' '"http://www.gstatic.com/generate_204"')
+    confirm_url=$(_ha_get '.fallback."confirm-url"' '"https://cp.cloudflare.com/generate_204"')
+    check_expected=$(_ha_get '.fallback."check-expected-status"' '204')
+    confirm_expected=$(_ha_get '.fallback."confirm-expected-status"' '204')
+    timeout=$(_ha_get '.fallback.timeout' '5000')
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        _ha_fallback_proxy_status_ok "$name" "$check_url" "$check_expected" "$timeout" || continue
+        _ha_fallback_proxy_status_ok "$name" "$confirm_url" "$confirm_expected" "$timeout" || continue
+        printf '%s\n' "$name"
+        return 0
+    done < <("$BIN_YQ" -r '.fallback.upstreams[]?.name' "$CLASH_HA_CONFIG" 2>/dev/null)
+    return 1
+}
+
+_ha_fallback_state_set() {
+    local route=$1 node=$2 since=$3 recovery_count=$4 codex_managed=$5
+    ROUTE=$route FALLBACK_NODE=$node FALLBACK_SINCE=$since RECOVERY_COUNT=$recovery_count FALLBACK_CODEX_MANAGED=$codex_managed \
+      "$BIN_YQ" -i '.route = strenv(ROUTE) | ."fallback-node" = strenv(FALLBACK_NODE) |
+        ."fallback-since" = (env(FALLBACK_SINCE) | tonumber) | ."recovery-count" = (env(RECOVERY_COUNT) | tonumber) |
+        ."fallback-codex-managed" = (strenv(FALLBACK_CODEX_MANAGED) == "true")' "$CLASH_HA_STATE"
+}
+
+_ha_fallback_apply() {
+    local node=$1 entry codex_entry codex_auto codex_selected codex_managed=false
+    entry=$(_ha_get '.group' '"HA-AUTO"')
+    _node_apply "$entry" "$node" >/dev/null || return 1
+    if _ha_codex_enabled && [ "$(_ha_get '.codex.mode' '"auto"')" = auto ]; then
+        codex_entry=$(_ha_get '.codex.group' '"CODEX"')
+        codex_auto=$(_ha_get '.codex."auto-group"' '"CODEX-HA"')
+        codex_selected=$(_node_now "$codex_entry")
+        if [ "$codex_selected" = "$codex_auto" ]; then
+            _node_apply "$codex_entry" "$node" >/dev/null && codex_managed=true
+        fi
+    fi
+    printf '%s\n' "$codex_managed"
+}
+
+_ha_fallback_restore() {
+    local best=$1 codex_managed=$2 local_group entry codex_entry codex_auto codex_selected
+    local_group=$(_ha_local_group)
+    entry=$(_ha_get '.group' '"HA-AUTO"')
+    _node_apply "$local_group" "$best" >/dev/null || return 1
+    _node_apply "$entry" "$local_group" >/dev/null || return 1
+    if [ "$codex_managed" = true ] && _ha_codex_enabled; then
+        codex_entry=$(_ha_get '.codex.group' '"CODEX"')
+        codex_auto=$(_ha_get '.codex."auto-group"' '"CODEX-HA"')
+        codex_selected=$(_node_now "$codex_entry")
+        _ha_fallback_is_node "$codex_selected" && _node_apply "$codex_entry" "$codex_auto" >/dev/null || true
+    fi
 }
 
 # 从有效的 name<TAB>delay 行中选择候选。地区偏好只在最快延迟加容差的
@@ -364,6 +491,12 @@ _ha_codex_check_once() {
     group=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
     entry_selected=$(_node_now "$entry_group")
     [ -n "$entry_selected" ] || return 1
+    if _ha_fallback_enabled && _ha_fallback_is_node "$entry_selected"; then
+        now=$(date +%s)
+        reason="Codex 随全局出口使用外部备用：$entry_selected"
+        _ha_codex_write_state "$now" "$entry_selected" '' "$entry_selected" '' 0 '' 0 "$reason"
+        return 0
+    fi
     if [ "$entry_selected" != "$group" ]; then
         now=$(date +%s)
         if [ "$(_ha_get '.codex.mode' '"auto"')" != fixed ] || [ "$(_ha_get '.codex."pinned-node"' '""')" != "$entry_selected" ]; then
@@ -397,7 +530,7 @@ _ha_codex_check_once() {
     while IFS=$'\t' read -r name delay; do
         [ "$name" = "$current" ] && current_delay=$delay
     done <<<"$delay_rows"
-    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows")
+    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows") || true
 
     failures=$(_ha_codex_state_get '.failures' '0')
     candidate=$(_ha_codex_state_get '.candidate' '""')
@@ -519,10 +652,12 @@ _ha_codex_check_if_due() {
 
 _ha_check_once() {
     service_is_active >/dev/null 2>&1 || return 1
-    local group url confirm_url timeout current best='' best_delay='' current_delay=''
+    local entry_group entry_selected group url confirm_url timeout current best='' best_delay='' current_delay=''
     local name delay failures candidate candidate_count now mode hold_until reason=healthy
     local region_enabled region_tolerance region_order delay_rows
-    group=$(_ha_get '.group' '"HA-AUTO"')
+    local route fallback_node fallback_since recovery_count fallback_codex_managed
+    entry_group=$(_ha_get '.group' '"HA-AUTO"')
+    group=$(_ha_local_group)
     url=$(_ha_get '.check-url' '"http://www.gstatic.com/generate_204"')
     confirm_url=$(_ha_get '.confirm-url' '"https://cp.cloudflare.com/generate_204"')
     timeout=$(_ha_get '.timeout' '5000')
@@ -543,7 +678,7 @@ _ha_check_once() {
         [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ] || continue
         [ "$name" = "$current" ] && current_delay=$delay
     done <<<"$delay_rows"
-    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows")
+    IFS=$'\t' read -r best best_delay < <(_ha_select_best "$region_tolerance" "$region_order" "$region_enabled" <<<"$delay_rows") || true
 
     failures=$(_ha_state_get '.failures' '0')
     candidate=$(_ha_state_get '.candidate' '""')
@@ -551,10 +686,91 @@ _ha_check_once() {
     now=$(date +%s)
     mode=$(_ha_get '.mode' '"auto"')
     hold_until=$(_ha_get '."hold-until"' '0')
+    route=$(_ha_state_get '.route' '"local"')
+    fallback_node=$(_ha_state_get '."fallback-node"' '""')
+    fallback_since=$(_ha_state_get '."fallback-since"' '0')
+    recovery_count=$(_ha_state_get '."recovery-count"' '0')
+    fallback_codex_managed=$(_ha_state_get '."fallback-codex-managed"' 'false')
+
+    if _ha_fallback_enabled; then
+        entry_selected=$(_node_now "$entry_group")
+        if _ha_fallback_is_node "$entry_selected"; then
+            route=fallback
+            fallback_node=$entry_selected
+            [ "$fallback_since" -gt 0 ] || fallback_since=$now
+        elif [ "$route" = fallback ]; then
+            route=local
+            fallback_node=''
+            fallback_since=0
+            recovery_count=0
+            fallback_codex_managed=false
+        fi
+    else
+        route=local
+    fi
 
     if [ "$mode" = hold ] && [ "$hold_until" -gt 0 ] && [ "$now" -ge "$hold_until" ]; then
         "$BIN_YQ" -i '.mode = "auto" | ."hold-until" = 0' "$CLASH_HA_CONFIG"
         mode=auto
+    fi
+
+    if [ "$route" = fallback ]; then
+        local confirm recovery_confirmations recovery_stable defer_recovery active replacement
+        recovery_confirmations=$(_ha_get '.fallback."recovery-confirmations"' '3')
+        recovery_stable=$(_ha_get '.fallback."recovery-stable-seconds"' '300')
+        defer_recovery=$(_ha_get '.fallback."defer-recovery-when-active"' 'true')
+        if [ -n "$best" ]; then
+            confirm=$(_node_delay_one "$best" "timeout=${timeout}&url=$(_node_urlencode "$confirm_url")" | cut -f2)
+            if [[ "$confirm" =~ ^[0-9]+$ ]] && [ "$confirm" -gt 0 ]; then
+                recovery_count=$((recovery_count + 1))
+                [ "$recovery_count" -le "$recovery_confirmations" ] || recovery_count=$recovery_confirmations
+                reason="本地候选恢复：$best，确认 ${recovery_count}/${recovery_confirmations}"
+                if [ "$recovery_count" -ge "$recovery_confirmations" ] && [ $((now - fallback_since)) -ge "$recovery_stable" ]; then
+                    active=0
+                    [ "$defer_recovery" = true ] && active=$(_ha_active_connections)
+                    if [ "$active" -gt 0 ]; then
+                        reason="本地节点已恢复，检测到 ${active} 条活跃连接，推迟回切"
+                    elif _ha_fallback_restore "$best" "$fallback_codex_managed"; then
+                        reason="外部备用恢复回切：$fallback_node -> $best"
+                        _ha_log "$reason"
+                        current=$best
+                        current_delay=$best_delay
+                        failures=0
+                        candidate=''
+                        candidate_count=0
+                        _ha_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" 0 '' 0 "$reason"
+                        _ha_fallback_state_set local '' 0 0 false
+                        _ha_record_switch "$now" "$reason"
+                        return 0
+                    else
+                        reason="本地节点已恢复，但回切失败"
+                    fi
+                fi
+            else
+                recovery_count=0
+                reason="外部备用生效中；本地候选确认失败"
+            fi
+        else
+            recovery_count=0
+            reason="外部备用生效中；本地节点仍全部不可用"
+        fi
+        replacement=$(_ha_fallback_choose 2>/dev/null || true)
+        if [ -n "$replacement" ] && [ "$replacement" != "$fallback_node" ]; then
+            _node_apply "$entry_group" "$replacement" >/dev/null && {
+                if [ "$fallback_codex_managed" = true ] && _ha_codex_enabled; then
+                    _node_apply "$(_ha_get '.codex.group' '"CODEX"')" "$replacement" >/dev/null || true
+                fi
+                reason="外部备用切换：$fallback_node -> $replacement"
+                _ha_log "$reason"
+                fallback_node=$replacement
+            }
+        elif [ -z "$replacement" ]; then
+            reason="本地节点和外部备用均不可用"
+        fi
+        _ha_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" "$failures" '' 0 "$reason"
+        _ha_fallback_state_set fallback "$fallback_node" "$fallback_since" "$recovery_count" "$fallback_codex_managed"
+        [ -n "$best" ] || _ha_recover "$now"
+        return 0
     fi
 
     if [ -z "$current_delay" ]; then
@@ -640,7 +856,26 @@ _ha_check_once() {
         fi
     fi
     _ha_write_state "$now" "$current" "$current_delay" "$best" "$best_delay" "$failures" "$candidate" "$candidate_count" "$reason"
-    if _ha_mode_allows_failure_switch "$mode" && [ -z "$best" ] && [ "$failures" -ge "$(_ha_get '.failure-confirmations' '2')" ]; then
+    local all_failed_confirmations
+    all_failed_confirmations=$(_ha_get '.failure-confirmations' '2')
+    _ha_fallback_enabled && all_failed_confirmations=$(_ha_get '.fallback."failure-confirmations"' '2')
+    if _ha_mode_allows_failure_switch "$mode" && [ -z "$best" ] && [ "$failures" -ge "$all_failed_confirmations" ]; then
+        if _ha_fallback_enabled; then
+            local selected codex_managed
+            selected=$(_ha_fallback_choose 2>/dev/null || true)
+            if [ -n "$selected" ]; then
+                codex_managed=$(_ha_fallback_apply "$selected") || codex_managed=false
+                if [ "$(_node_now "$entry_group")" = "$selected" ]; then
+                    reason="本地节点全部不可用，切换外部备用：$selected"
+                    _ha_log "$reason"
+                    _ha_write_state "$now" "$current" "$current_delay" '' '' 0 '' 0 "$reason"
+                    _ha_fallback_state_set fallback "$selected" "$now" 0 "$codex_managed"
+                    _ha_record_switch "$now" "$reason"
+                    return 0
+                fi
+            fi
+            _ha_log "WARN 本地节点全部不可用，外部备用也不可用"
+        fi
         _ha_recover "$now"
     fi
 }
@@ -650,6 +885,11 @@ _ha_recover() {
     last=$(_ha_get '."last-recovery"' '0')
     [ $((now - last)) -ge 600 ] || return 0
     LAST_RECOVERY=$now "$BIN_YQ" -i '."last-recovery" = (env(LAST_RECOVERY) | tonumber)' "$CLASH_HA_CONFIG"
+    if [ "$(_ha_state_get '.route' '"local"')" = fallback ]; then
+        _ha_log "外部备用生效中，更新订阅缓存但不重启 Mihomo"
+        _sub_update --all >>"$CLASH_HA_LOG" 2>&1 || true
+        return 0
+    fi
     _ha_log "全部候选不可用，尝试更新所有订阅并重建候选池"
     _sub_update --all >>"$CLASH_HA_LOG" 2>&1 || true
     _ha_build_and_restart >>"$CLASH_HA_LOG" 2>&1 || _ha_log "ERROR 自动恢复重建失败"
@@ -960,6 +1200,74 @@ _ha_lan_enable() {
     _okcat "客户端订阅：http://${server}:$(_ha_get '.lan.subscription-port' '8088')/sub/${token}"
 }
 
+_ha_fallback_test() {
+    _ha_fallback_enabled || { _errorcat "外部备用未启用或未配置"; return 1; }
+    local check_url confirm_url check_expected confirm_expected timeout name healthy=0
+    check_url=$(_ha_get '.fallback."check-url"' '"http://www.gstatic.com/generate_204"')
+    confirm_url=$(_ha_get '.fallback."confirm-url"' '"https://cp.cloudflare.com/generate_204"')
+    check_expected=$(_ha_get '.fallback."check-expected-status"' '204')
+    confirm_expected=$(_ha_get '.fallback."confirm-expected-status"' '204')
+    timeout=$(_ha_get '.fallback.timeout' '5000')
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        if _ha_fallback_proxy_status_ok "$name" "$check_url" "$check_expected" "$timeout" &&
+          _ha_fallback_proxy_status_ok "$name" "$confirm_url" "$confirm_expected" "$timeout"; then
+            printf '外部备用：%s 可用\n' "$name"
+            healthy=$((healthy + 1))
+        else
+            printf '外部备用：%s 不可用\n' "$name"
+        fi
+    done < <("$BIN_YQ" -r '.fallback.upstreams[]?.name' "$CLASH_HA_CONFIG" 2>/dev/null)
+    [ "$healthy" -gt 0 ]
+}
+
+_ha_fallback_status() {
+    if ! _ha_fallback_enabled; then
+        printf '外部备用：停用\n'
+        return 0
+    fi
+    local entry local_group selected route node recovery route_suffix=''
+    entry=$(_ha_get '.group' '"HA-AUTO"')
+    local_group=$(_ha_local_group)
+    selected=$(_node_now "$entry")
+    route=$(_ha_state_get '.route' '"local"')
+    node=$(_ha_state_get '."fallback-node"' '""')
+    recovery=$(_ha_state_get '."recovery-count"' '0')
+    [ -z "$node" ] || route_suffix="（${node}）"
+    printf '外部备用：启用（出口：%s -> %s）\n' "$entry" "${selected:-—}"
+    printf '本地节点组：%s\n' "$local_group"
+    printf '出口状态：%s%s\n' "$route" "$route_suffix"
+    printf '本地恢复确认：%s/%s\n' "$recovery" "$(_ha_get '.fallback."recovery-confirmations"' '3')"
+}
+
+_ha_fallback_set() {
+    local server=$1 http_port=$2 socks_port=$3 backup
+    [ -n "$server" ] || { _errorcat "备用服务器地址不能为空"; return 1; }
+    [[ "$http_port" =~ ^[0-9]+$ ]] && [ "$http_port" -ge 1 ] && [ "$http_port" -le 65535 ] || {
+        _errorcat "HTTP 端口无效：$http_port"
+        return 1
+    }
+    [[ "$socks_port" =~ ^[0-9]+$ ]] && [ "$socks_port" -ge 1 ] && [ "$socks_port" -le 65535 ] || {
+        _errorcat "SOCKS5 端口无效：$socks_port"
+        return 1
+    }
+    backup=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-fallback-backup.XXXXXX") || return 1
+    /bin/cp -f "$CLASH_HA_CONFIG" "$backup"
+    SERVER=$server HTTP_PORT=$http_port SOCKS_PORT=$socks_port "$BIN_YQ" -i '
+      .fallback.enabled = true |
+      .fallback.upstreams = [
+        {"name": "JSSS-SOCKS", "type": "socks5", "server": strenv(SERVER), "port": (env(SOCKS_PORT) | tonumber), "udp": true},
+        {"name": "JSSS-HTTP", "type": "http", "server": strenv(SERVER), "port": (env(HTTP_PORT) | tonumber)}
+      ]' "$CLASH_HA_CONFIG" || { /bin/mv -f "$backup" "$CLASH_HA_CONFIG"; return 1; }
+    if ! _ha_build_and_restart; then
+        /bin/mv -f "$backup" "$CLASH_HA_CONFIG"
+        _errorcat "外部备用配置失败，已恢复原配置"
+        return 1
+    fi
+    /usr/bin/rm -f "$backup"
+    _ha_fallback_test || _failcat "外部备用配置已保存，但当前探测失败"
+}
+
 _ha_codex_status() {
     if ! _ha_codex_enabled; then
         printf 'Codex HA：停用\n'
@@ -970,10 +1278,16 @@ _ha_codex_status() {
     auto=$(_ha_get '.codex.auto-group' '"CODEX-HA"')
     selected=$(_node_now "$entry")
     current=$(_node_now "$auto")
-    [ "$selected" = "$auto" ] && mode=auto || mode=fixed
+    if _ha_fallback_enabled && _ha_fallback_is_node "$selected"; then
+        mode=fallback
+    elif [ "$selected" = "$auto" ]; then
+        mode=auto
+    else
+        mode=fixed
+    fi
     printf 'Codex HA：启用（%s）\n' "$mode"
     printf 'Codex 入口：%s -> %s\n' "$entry" "${selected:-—}"
-    [ "$mode" = fixed ] && current=$selected
+    [ "$mode" = auto ] || current=$selected
     printf 'Codex 当前节点：%s (%sms)\n' "${current:-—}" "$(_ha_codex_state_get '."current-delay"' '"—"')"
     printf 'Codex 本轮最优：%s (%sms)\n' "$(_ha_codex_state_get '.best' '"—"')" "$(_ha_codex_state_get '."best-delay"' '"—"')"
     printf 'Codex 最近判断：%s\n' "$(_ha_codex_state_get '."last-reason"' '"尚未检测"')"
@@ -1009,6 +1323,7 @@ _ha_status() {
     printf '本轮最优：%s (%sms)\n' "$(_ha_state_get '.best' '"—"')" "$(_ha_state_get '."best-delay"' '"—"')"
     printf '最近判断：%s\n' "$(_ha_state_get '."last-reason"' '"尚未检测"')"
     printf '检测时间：%s\n' "$(_ha_state_get '."checked-at"' '"—"')"
+    _ha_fallback_status
     _ha_codex_status
     _ha_subscription_update_status
     if "$BIN_YQ" -e '.lan.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1; then
@@ -1054,7 +1369,13 @@ clashha() {
     resume) "$BIN_YQ" -i '.mode = "auto" | ."hold-until" = 0' "$CLASH_HA_CONFIG"; _okcat "已恢复自动优选" ;;
     pin)
         [ -n "${2:-}" ] || { _errorcat "用法：clashctl ha pin <节点全名>"; return 1; }
-        _node_apply "$(_ha_get '.group' '"HA-AUTO"')" "$2" || return 1
+        local pin_group
+        pin_group=$(_ha_local_group)
+        _node_apply "$pin_group" "$2" || return 1
+        if _ha_fallback_enabled; then
+            _node_apply "$(_ha_get '.group' '"HA-AUTO"')" "$pin_group" || return 1
+            [ ! -f "$CLASH_HA_STATE" ] || _ha_fallback_state_set local '' 0 0 false
+        fi
         "$BIN_YQ" -i '.mode = "pin"' "$CLASH_HA_CONFIG"
         ;;
     unpin) "$BIN_YQ" -i '.mode = "auto"' "$CLASH_HA_CONFIG"; _okcat "已解除严格固定" ;;
@@ -1093,6 +1414,34 @@ clashha() {
         *) _errorcat "用法：clashctl ha codex enable|disable|check|status|auto|pin <节点全名>" ;;
         esac
         ;;
+    fallback)
+        case "${2:-status}" in
+        set)
+            [ -n "${3:-}" ] && [ -n "${4:-}" ] && [ -n "${5:-}" ] || {
+                _errorcat "用法：clashctl ha fallback set <服务器> <HTTP端口> <SOCKS5端口>"
+                return 1
+            }
+            _ha_fallback_set "$3" "$4" "$5"
+            ;;
+        test) _ha_fallback_test ;;
+        status) _ha_fallback_status ;;
+        disable)
+            local fallback_backup
+            fallback_backup=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-fallback-backup.XXXXXX") || return 1
+            /bin/cp -f "$CLASH_HA_CONFIG" "$fallback_backup"
+            "$BIN_YQ" -i '.fallback.enabled = false' "$CLASH_HA_CONFIG"
+            if _ha_build_and_restart; then
+                /usr/bin/rm -f "$fallback_backup"
+                [ ! -f "$CLASH_HA_STATE" ] || _ha_fallback_state_set local '' 0 0 false
+                _okcat "外部备用已停用"
+            else
+                /bin/mv -f "$fallback_backup" "$CLASH_HA_CONFIG"
+                return 1
+            fi
+            ;;
+        *) _errorcat "用法：clashctl ha fallback set|test|status|disable" ;;
+        esac
+        ;;
     lan)
         case "${2:-}" in
         enable) _ha_lan_enable "${3:-}" "${4:-}" "${5:-}" ;;
@@ -1126,6 +1475,10 @@ clashctl ha - 多订阅高可用
   codex status            查看 OpenAI/Codex 组状态
   codex auto              在 Web UI 固定节点后恢复自动模式
   codex pin <节点全名>    固定 OpenAI/Codex 节点，完全停止自动切换
+  fallback set <服务器> <HTTP端口> <SOCKS5端口> 配置并启用外部备用
+  fallback test           检测全部外部备用入口
+  fallback status         查看外部备用出口状态
+  fallback disable        停用外部备用并恢复单层本地节点组
   lan enable [CIDR] [用户] [地址] 开启局域网代理和客户端订阅
   lan disable             关闭局域网入口
   log [-n 行数]           查看 HA 日志

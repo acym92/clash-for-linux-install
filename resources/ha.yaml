@@ -17,6 +17,19 @@ region-preference:
     - japan
     - hong-kong
     - other
+fallback:
+  enabled: false
+  local-group: HA-LOCAL
+  failure-confirmations: 2
+  recovery-confirmations: 3
+  recovery-stable-seconds: 300
+  defer-recovery-when-active: true
+  check-url: http://www.gstatic.com/generate_204
+  check-expected-status: 204
+  confirm-url: https://cp.cloudflare.com/generate_204
+  confirm-expected-status: 204
+  timeout: 5000
+  upstreams: []
 ha-domains:
   - ws.okx.com
 codex:

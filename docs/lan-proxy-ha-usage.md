@@ -97,6 +97,70 @@ clashctl ha codex pin '[订阅名] 节点名'
 clashctl ha codex disable
 ```
 
+## 外部代理兜底
+
+当所有订阅节点都不可用时，可以让 Linux 代理入口临时转发到另一台 HTTP/SOCKS5 代理服务器。客户端仍连接原来的 Linux 地址，故障切换和恢复回切都由 HA 调度器完成。
+
+启用后，基础订阅中原有的代理策略组统一经 `HA-AUTO` 出口转发，因此所有原本需要代理的 TCP 流量都会跟随外部备用切换；原本命中 `DIRECT`、`REJECT` 等直连或拦截规则的流量保持原行为。
+
+例如将 `192.168.31.47:9098` 配置为 HTTP 备用、`192.168.31.47:9099` 配置为 SOCKS5 备用：
+
+```bash
+clashctl ha fallback set 192.168.31.47 9098 9099
+clashctl ha fallback test
+clashctl ha fallback status
+```
+
+如果容器网络不能直接访问备用服务器，可以先把备用端口反向转发到本机，再配置回环地址。例如将备用 HTTP/SOCKS5 端口分别映射到本机 `19098/19099` 后使用：
+
+```bash
+clashctl ha fallback set 127.0.0.1 19098 19099
+```
+
+生成的结构为：
+
+```text
+HA-AUTO
+├── HA-LOCAL        # 原有订阅节点，由延迟和地区策略管理
+├── JSSS-SOCKS      # 首选外部备用，支持 UDP 配置
+└── JSSS-HTTP       # HTTP/HTTPS TCP 备用
+```
+
+外部备用不会参与正常的延迟排名。只有本地节点池连续达到 `fallback.failure-confirmations` 次全体不可用，且外部代理通过两个实际请求检查时，`HA-AUTO` 才切换到外部代理。外部代理生效期间仍会探测本地节点；本地候选连续达到 `recovery-confirmations` 次健康，并经过 `recovery-stable-seconds` 稳定期后才回切。
+
+默认开启 `defer-recovery-when-active`，存在活跃连接时推迟恢复回切。严格固定 `pin` 模式不会自动进入外部备用。停用并恢复原来的单层节点组：
+
+```bash
+clashctl ha fallback disable
+```
+
+对应的配置保存在 `resources/ha.yaml`：
+
+```yaml
+fallback:
+  enabled: true
+  local-group: HA-LOCAL
+  failure-confirmations: 2
+  recovery-confirmations: 3
+  recovery-stable-seconds: 300
+  defer-recovery-when-active: true
+  check-url: http://www.gstatic.com/generate_204
+  check-expected-status: 204
+  confirm-url: https://cp.cloudflare.com/generate_204
+  confirm-expected-status: 204
+  timeout: 5000
+  upstreams:
+    - name: JSSS-SOCKS
+      type: socks5
+      server: 192.168.31.47
+      port: 9099
+      udp: true
+    - name: JSSS-HTTP
+      type: http
+      server: 192.168.31.47
+      port: 9098
+```
+
 后台默认每 30 秒检测一次。性能切换要求候选至少快 80ms、同时改善至少 30%，并连续三轮成立；性能切换后冷却 10 分钟。当前节点连续两轮在主目标和确认目标上都失败时，会切换到本轮可用的最低延迟节点。
 
 会议、长下载期间可以暂停性能切换，故障切换仍然保留：
@@ -168,6 +232,8 @@ subscription-update:
 ## 已知边界
 
 - 正常切换不会主动清空连接，但旧节点失效时，建立在旧节点上的连接无法迁移，应用需要重连。
+- 外部备用切换同样不能迁移已有 TCP/UDP 会话；切换后新连接使用新的出口。
+- HTTP 外部备用只承载 TCP。需要 UDP 时应使用支持 UDP 的 SOCKS5 上游，并在真实应用中验证。
 - 自动判断基于连通性和 HTTP 延迟。当前版本没有用大文件持续测速，避免测速抢占局域网带宽。
 - 单机方案不能处理 Linux 服务器断电、局域网或宽带本身故障。
 - 客户端订阅服务使用局域网 HTTP 和随机令牌；只应部署在可信且有防火墙隔离的网络。

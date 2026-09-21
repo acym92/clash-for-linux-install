@@ -49,8 +49,24 @@ _ha_build_config
 [ "$("$BIN_YQ" '.rules[-1]' "$_HA_BUILD_FILE")" = 'MATCH,PROXY' ]
 [ "$("$BIN_YQ" '.profile."store-selected"' "$_HA_BUILD_FILE")" = true ]
 
+fallback_config="$test_dir/ha-fallback.yaml"
+SERVER=192.168.31.47 "$BIN_YQ" '
+  .codex.enabled = true |
+  .fallback.enabled = true |
+  .fallback.upstreams = [
+    {"name": "JSSS-SOCKS", "type": "socks5", "server": strenv(SERVER), "port": 9099, "udp": true},
+    {"name": "JSSS-HTTP", "type": "http", "server": strenv(SERVER), "port": 9098}
+  ]' "$root/resources/ha.yaml" >"$fallback_config"
+CLASH_HA_CONFIG=$fallback_config
+_ha_build_config
+[ "$("$BIN_YQ" '.proxies | length' "$_HA_BUILD_FILE")" = 4 ]
+[ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "HA-AUTO") | .proxies' "$_HA_BUILD_FILE")" = '["HA-LOCAL","JSSS-SOCKS","JSSS-HTTP"]' ]
+[ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "HA-LOCAL") | .proxies' "$_HA_BUILD_FILE")" = '["[A] node-one","[B] node-two"]' ]
+[ "$("$BIN_YQ" -o=json -I=0 '.proxy-groups[] | select(.name == "CODEX") | .proxies' "$_HA_BUILD_FILE")" = '["CODEX-HA","[A] node-one","[B] node-two","JSSS-SOCKS","JSSS-HTTP"]' ]
+
 PINNED='[B] node-two' "$BIN_YQ" '.codex.mode = "fixed" | .codex."pinned-node" = strenv(PINNED)' "$codex_config" >"${codex_config}.new"
 mv "${codex_config}.new" "$codex_config"
+CLASH_HA_CONFIG=$codex_config
 _ha_build_config
 [ "$("$BIN_YQ" '.proxy-groups[] | select(.name == "CODEX") | .proxies[0]' "$_HA_BUILD_FILE")" = '[B] node-two' ]
 
