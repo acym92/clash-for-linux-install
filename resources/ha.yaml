@@ -61,6 +61,8 @@ subscription-update:
   enabled: true
   interval: 21600
   retry-interval: 900
+  apply-mode: reload
+  download-via-proxy: true
   defer-when-active: true
 last-recovery: 0
 mode: auto

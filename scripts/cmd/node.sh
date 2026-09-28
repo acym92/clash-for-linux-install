@@ -50,8 +50,12 @@ clashnode() {
 ########################################
 
 _node_api_base() {
-    _detect_ext_addr # 填充 EXT_PORT（服务运行时不会触发改端口分支）
-    printf 'http://127.0.0.1:%s' "$EXT_PORT"
+    local address port
+    address=$("$BIN_YQ" '."external-controller" // ""' "$CLASH_CONFIG_RUNTIME") || return 1
+    port=${address##*:}
+    [[ "$port" =~ ^[1-9][0-9]*$ ]] || return 1
+    # Health checks must never reassign a configured port during a restart.
+    printf 'http://127.0.0.1:%s' "$port"
 }
 
 # 统一 curl 封装：--noproxy '*' 避免走系统代理；secret 非空时带 Bearer

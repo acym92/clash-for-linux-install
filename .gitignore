@@ -28,7 +28,14 @@ resources/ha.pid
 resources/ha.pid.lock
 resources/ha.pid.launch.lock
 resources/ha-sub.pid
+resources/ha-update.pid
 resources/ha-sub.token
+resources/ha-sub-update-state.yaml.lock
+resources/supervisor.*
+resources/*.pid.launch.lock
+resources/*.pid
+resources/*.pid.lock
+resources/*.log
 
 # Interrupted atomic writes may leave these temporary files behind
 resources/.fetch.*

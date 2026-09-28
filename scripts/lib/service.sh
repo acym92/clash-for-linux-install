@@ -58,7 +58,11 @@ service_start() {
         ;;
     nohup | *)
         (
-            nohup "$BIN_KERNEL" -d "$CLASH_RESOURCES_DIR" -f "$CLASH_CONFIG_RUNTIME" </dev/null >"$service_log_path" 2>&1 &
+            exec 8>"${service_pid_path}.launch.lock"
+            flock -w 30 8 || exit 1
+            [ -n "$(service_kernel_pids)" ] && exit 0
+            nohup "$BIN_KERNEL" -d "$CLASH_RESOURCES_DIR" -f "$CLASH_CONFIG_RUNTIME" </dev/null 7>&- 8>&- 9>&- >>"$service_log_path" 2>&1 &
+            printf '%s\n' "$!" >"$service_pid_path"
         )
         ;;
     esac
@@ -68,7 +72,7 @@ service_sudo_start() {
     _is_root && service_start && return 0
     detect_service_manager
     (
-        sudo sh -c "nohup '$BIN_KERNEL' -d '$CLASH_RESOURCES_DIR' -f '$CLASH_CONFIG_RUNTIME' </dev/null > '$service_log_path' 2>&1 &"
+        sudo sh -c "nohup '$BIN_KERNEL' -d '$CLASH_RESOURCES_DIR' -f '$CLASH_CONFIG_RUNTIME' </dev/null >> '$service_log_path' 2>&1 &"
         stty opost 2>/dev/null
     )
 }
@@ -97,9 +101,12 @@ service_stop() {
         sv down "$CLASHCTL_KERNEL"
         ;;
     nohup | *)
-        pkill -TERM -x "$CLASHCTL_KERNEL" 2>/dev/null
+        local pid pids
+        pids=$(service_kernel_pids)
+        for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
         sleep 0.2
-        pkill -KILL -x "$CLASHCTL_KERNEL" 2>/dev/null
+        for pid in $(service_kernel_pids); do kill -KILL "$pid" 2>/dev/null || true; done
+        /usr/bin/rm -f "$service_pid_path"
         ;;
     esac
 }
@@ -143,7 +150,9 @@ service_status() {
         sv status "$CLASHCTL_KERNEL" "$@"
         ;;
     nohup | *)
-        pgrep -fa "$BIN_KERNEL"
+        local pids
+        pids=$(service_kernel_pids | paste -sd,)
+        [ -n "$pids" ] && ps -p "$pids" -o pid,args
         ;;
     esac
 }
@@ -164,9 +173,40 @@ service_is_active() {
         sv status "$CLASHCTL_KERNEL" 2>/dev/null | grep -qs '^run'
         ;;
     nohup | *)
-        pgrep -fa "$BIN_KERNEL" >/dev/null 2>&1
+        [ -n "$(service_kernel_pids)" ]
         ;;
     esac
+}
+
+# Match the executable argument, exclude validation processes and zombies, and
+# avoid mistaking another installation or a diagnostic command for the kernel.
+service_kernel_pids() {
+    local pid stat state arg args=()
+    for pid in $(pgrep -x "$CLASHCTL_KERNEL" 2>/dev/null); do
+        [ -r "/proc/$pid/stat" ] || continue
+        stat=$(<"/proc/$pid/stat")
+        state=${stat##*) }
+        state=${state%% *}
+        [ "$state" != Z ] || continue
+        mapfile -d '' args <"/proc/$pid/cmdline" 2>/dev/null || continue
+        [ "${args[0]:-}" = "$BIN_KERNEL" ] || continue
+        for arg in "${args[@]}"; do
+            [ "$arg" != -t ] && [ "$arg" != --test ] || continue 2
+        done
+        printf '%s\n' "$pid"
+    done
+}
+
+service_wait_ready() {
+    local timeout=${1:-${CLASHCTL_SERVICE_READY_TIMEOUT:-30}} deadline
+    [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || timeout=30
+    deadline=$((SECONDS + timeout))
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        [ -z "${CLASHCTL_SERVICE_CANCEL_FILE:-}" ] || [ -f "$CLASHCTL_SERVICE_CANCEL_FILE" ] || return 1
+        service_is_active && CLASHCTL_API_TIMEOUT=1 _node_curl GET /version --fail >/dev/null 2>&1 && return 0
+        sleep 0.2
+    done
+    return 1
 }
 
 service_log() {

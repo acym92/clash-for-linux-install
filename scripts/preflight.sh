@@ -14,7 +14,7 @@ ZIP_BASE_DIR="${ARCHIVE_BASE_DIR}"
 CLASHCTL_CMD_DIR="${CLASHCTL_HOME}/scripts/cmd"
 
 valid_required() {
-    local required_cmds=("xz" "pgrep" "pkill" "curl" "tar" 'unzip' 'gzip' 'shuf')
+    local required_cmds=("xz" "pgrep" "pkill" "curl" "tar" 'unzip' 'gzip' 'shuf' 'flock')
     local missing=()
     for cmd in "${required_cmds[@]}"; do
         command -v "$cmd" >&/dev/null || missing+=("$cmd")

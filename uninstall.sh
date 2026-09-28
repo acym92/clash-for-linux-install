@@ -3,11 +3,16 @@
 CLASHCTL_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 . "$CLASHCTL_SRC/scripts/preflight.sh"
 . "$CLASHCTL_SRC/scripts/cmd/off.sh"
+. "$CLASHCTL_SRC/scripts/cmd/ha.sh"
+. "$CLASHCTL_SRC/scripts/cmd/supervise.sh"
 
 ! _is_root && tunstatus >&/dev/null && {
     _errorcat "请先关闭 Tun 模式"
     exit
 }
+_supervisor_stop || exit 1
+_ha_stop_daemon
+_ha_stop_subscription_server
 uninstall_service
 
 # 清理多订阅 HA 辅助服务。

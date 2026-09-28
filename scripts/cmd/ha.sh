@@ -188,6 +188,66 @@ _ha_build_and_restart() {
     _okcat "已聚合 $_HA_BUILD_COUNT 个节点到 [$(_ha_get '.group' '"HA-AUTO"')]"
 }
 
+_ha_reload_config() {
+    local body code
+    body=$(CONFIG_PATH=$CLASH_CONFIG_RUNTIME "$BIN_YQ" -n -o=json '{"path": strenv(CONFIG_PATH)}') || return 1
+    code=$(CLASHCTL_API_TIMEOUT=60 _node_curl PUT '/configs?force=false' \
+        -H 'Content-Type: application/json' --data-raw "$body" -o /dev/null -w '%{http_code}') || return 1
+    [ "$code" = 204 ]
+}
+
+_ha_ingress_fingerprint() {
+    "$BIN_YQ" -o=json -I=0 '[.port, ."socks-port", ."mixed-port", ."redir-port", ."tproxy-port",
+        ."external-controller", ."external-controller-tls", ."external-controller-unix", .secret,
+        ."bind-address", ."allow-lan", .authentication, ."skip-auth-prefixes",
+        ."lan-allowed-ips", ."lan-disallowed-ips", .tun, .listeners, .tunnels]' "$1"
+}
+
+# Apply subscriptions in the existing process without closing its connections.
+# Surviving selections also remain first if no selection was cached.
+_ha_build_and_reload() {
+    service_is_active || return 1
+    _ha_build_config || return 1
+    local work=$_HA_BUILD_FILE selections backup_base backup_runtime rc=0 attempted=false
+    selections=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-selections.XXXXXX") || { /usr/bin/rm -f "$work"; return 1; }
+    backup_base=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-base-backup.XXXXXX") || { /usr/bin/rm -f "$work" "$selections"; return 1; }
+    backup_runtime=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-runtime-backup.XXXXXX") || { /usr/bin/rm -f "$work" "$selections" "$backup_base"; return 1; }
+    if ! /bin/cp -f "$CLASH_CONFIG_BASE" "$backup_base" || ! /bin/cp -f "$CLASH_CONFIG_RUNTIME" "$backup_runtime"; then
+        /usr/bin/rm -f "$work" "$selections" "$backup_base" "$backup_runtime"
+        return 1
+    fi
+    if ! _node_curl GET /proxies --fail >"$selections"; then
+        rc=1
+    elif ! SELECTIONS=$selections "$BIN_YQ" -i '
+        load(strenv(SELECTIONS)) as $state |
+        ."proxy-groups"[] |= (
+          .name as $name | $state.proxies[$name].now as $selected |
+          ((select($selected != null and (.proxies | contains([$selected]))) |
+            .proxies = ([$selected] + (.proxies | map(select(. != $selected))))) // .))
+        ' "$work"; then
+        rc=1
+    else
+        /bin/mv -f "$work" "$CLASH_CONFIG_BASE"
+        if ! _merge_config; then
+            rc=1
+        elif [ "$(_ha_ingress_fingerprint "$backup_runtime")" != "$(_ha_ingress_fingerprint "$CLASH_CONFIG_RUNTIME")" ]; then
+            _ha_log "WARN 订阅热重载取消：监听、认证或 TUN 配置发生变化，请显式刷新配置"
+            rc=1
+        else
+            attempted=true
+            _ha_reload_config && service_wait_ready || rc=1
+        fi
+    fi
+    if [ "$rc" -ne 0 ]; then
+        /bin/cp -f "$backup_base" "$CLASH_CONFIG_BASE"
+        /bin/cp -f "$backup_runtime" "$CLASH_CONFIG_RUNTIME"
+        # A timed-out request may have reached the kernel; restore its config too.
+        [ "$attempted" != true ] || _ha_reload_config || _ha_log "ERROR 热重载回滚请求失败，已恢复磁盘配置"
+    fi
+    /usr/bin/rm -f "$work" "$selections" "$backup_base" "$backup_runtime"
+    return "$rc"
+}
+
 _ha_write_state() {
     local now=$1 current=$2 current_delay=$3 best=$4 best_delay=$5 failures=$6 candidate=$7 candidate_count=$8 reason=$9
     local last_switch route fallback_node fallback_since recovery_count fallback_codex_managed
@@ -904,17 +964,24 @@ _ha_sub_update_state_get() {
 }
 
 _ha_sub_update_state_write() {
-    local last_attempt=$1 last_success=$2 next_attempt=$3 pending=$4 applied_fingerprint=$5 pending_fingerprint=$6 reason=$7
+    local last_attempt=$1 last_success=$2 next_download=$3 next_apply=$4 pending=$5 applied_fingerprint=$6 pending_fingerprint=$7 reason=$8
+    local last_download_success=$9 pending_since=${10} download_reason=${11} next_attempt=$3
+    [ "$pending" != true ] || [ "$next_apply" -ge "$next_attempt" ] || next_attempt=$next_apply
     LAST_ATTEMPT=$last_attempt LAST_SUCCESS=$last_success NEXT_ATTEMPT=$next_attempt PENDING=$pending \
-      APPLIED_FINGERPRINT=$applied_fingerprint PENDING_FINGERPRINT=$pending_fingerprint REASON=$reason \
+      NEXT_DOWNLOAD=$next_download NEXT_APPLY=$next_apply LAST_DOWNLOAD_SUCCESS=$last_download_success PENDING_SINCE=$pending_since \
+      APPLIED_FINGERPRINT=$applied_fingerprint PENDING_FINGERPRINT=$pending_fingerprint REASON=$reason DOWNLOAD_REASON=$download_reason \
       "$BIN_YQ" -n '
         {"last-attempt": (env(LAST_ATTEMPT) | tonumber),
          "last-success": (env(LAST_SUCCESS) | tonumber),
          "next-attempt": (env(NEXT_ATTEMPT) | tonumber),
+         "next-download": (env(NEXT_DOWNLOAD) | tonumber),
+         "next-apply": (env(NEXT_APPLY) | tonumber),
+         "last-download-success": (env(LAST_DOWNLOAD_SUCCESS) | tonumber),
+         "pending-since": (env(PENDING_SINCE) | tonumber),
          "pending": (env(PENDING) == "true"),
          "applied-fingerprint": strenv(APPLIED_FINGERPRINT),
          "pending-fingerprint": strenv(PENDING_FINGERPRINT),
-         "last-reason": strenv(REASON)}
+         "last-reason": strenv(REASON), "download-reason": strenv(DOWNLOAD_REASON)}
       ' >"${CLASH_HA_SUB_UPDATE_STATE}.new" && /bin/mv -f "${CLASH_HA_SUB_UPDATE_STATE}.new" "$CLASH_HA_SUB_UPDATE_STATE"
 }
 
@@ -939,66 +1006,177 @@ _ha_active_connections() {
 }
 
 _ha_subscription_update_if_due() {
+    (
+        exec 8>"${CLASH_HA_SUB_UPDATE_STATE}.lock"
+        flock -n 8 || exit 0
+        _ha_subscription_update_locked "${1:-}"
+    )
+}
+
+_ha_subscription_download() {
+    (
+        # LAN deployments may be unable to resolve/reach subscription hosts
+        # directly. Use the same working entrypoint as clients, without changing
+        # the caller's environment or proxy selection.
+        if [ "$("$BIN_YQ" '.subscription-update."download-via-proxy" != false' "$CLASH_HA_CONFIG")" = true ] && service_is_active; then
+            local host port auth user password address
+            host=$(_ha_get '.lan.server' '""')
+            [ -n "$host" ] || host=$(_get_bind_addr)
+            port=$("$BIN_YQ" '."mixed-port" // .port // ""' "$CLASH_CONFIG_RUNTIME")
+            auth=$("$BIN_YQ" '.authentication[0] // ""' "$CLASH_CONFIG_RUNTIME")
+            if [ -n "$auth" ]; then
+                user=${auth%%:*}
+                password=${auth#*:}
+                auth="$(_node_urlencode "$user"):$(_node_urlencode "$password")@"
+            fi
+            [[ "$host" != *:* ]] || host="[$host]"
+            if [ -n "$port" ]; then
+                address="http://${auth}${host}:${port}"
+                export http_proxy=$address https_proxy=$address HTTP_PROXY=$address HTTPS_PROXY=$address
+                export no_proxy=localhost,127.0.0.1,::1 NO_PROXY=localhost,127.0.0.1,::1
+            fi
+        fi
+        _sub_update --all
+    )
+}
+
+_ha_subscription_apply() {
+    local mode=$1
+    if [ "$mode" = reload ]; then
+        _ha_build_and_reload >>"$CLASH_HA_LOG" 2>&1 || return 1
+    else
+        _ha_build_and_restart >>"$CLASH_HA_LOG" 2>&1 || return 1
+    fi
+    _ha_client_config >>"$CLASH_HA_LOG" 2>&1 || return 1
+    _ha_profiles_fingerprint
+}
+
+_ha_subscription_update_locked() {
     [ "$(_ha_get '.subscription-update.enabled' 'false')" = true ] || return 0
-    local now interval retry defer pending last_attempt last_success next_attempt applied_fingerprint pending_fingerprint
-    local before after reason active
+    local now interval retry defer pending last_attempt last_success next_download next_apply applied_fingerprint pending_fingerprint
+    local before after reason active mode last_download_success pending_since download_reason applied_snapshot
     now=$(date +%s)
     interval=$(_ha_get '.subscription-update.interval' '21600')
     retry=$(_ha_get '.subscription-update."retry-interval"' '900')
-    defer=$(_ha_get '.subscription-update."defer-when-active"' 'true')
-    [[ "$interval" =~ ^[0-9]+$ ]] || interval=21600
-    [[ "$retry" =~ ^[0-9]+$ ]] || retry=900
+    defer=$("$BIN_YQ" '.subscription-update."defer-when-active" != false' "$CLASH_HA_CONFIG")
+    mode=$(_ha_get '.subscription-update."apply-mode"' '"reload"')
+    [ "$mode" = reload ] || [ "$mode" = restart ] || { _ha_log "ERROR 无效的订阅 apply-mode：$mode"; return 1; }
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=21600
+    [[ "$retry" =~ ^[1-9][0-9]*$ ]] || retry=900
     pending=$(_ha_sub_update_state_get '.pending' 'false')
     last_attempt=$(_ha_sub_update_state_get '."last-attempt"' '0')
     last_success=$(_ha_sub_update_state_get '."last-success"' '0')
-    next_attempt=$(_ha_sub_update_state_get '."next-attempt"' '0')
+    # Old pending work must not suppress the independent download schedule.
+    next_download=$(_ha_sub_update_state_get '."next-download"' "$((last_attempt > 0 ? last_attempt + interval : 0))")
+    next_apply=$(_ha_sub_update_state_get '."next-apply"' '0')
+    last_download_success=$(_ha_sub_update_state_get '."last-download-success"' '0')
+    pending_since=$(_ha_sub_update_state_get '."pending-since"' '0')
+    download_reason=$(_ha_sub_update_state_get '."download-reason"' '"尚未下载"')
+    reason=$(_ha_sub_update_state_get '."last-reason"' '"尚未执行"')
     applied_fingerprint=$(_ha_sub_update_state_get '."applied-fingerprint"' '""')
     pending_fingerprint=$(_ha_sub_update_state_get '."pending-fingerprint"' '""')
-    [ "$now" -ge "$next_attempt" ] || return 0
+    [ "${1:-}" != --force ] || { next_download=0; next_apply=0; }
     before=$(_ha_profiles_fingerprint)
     [ -n "$applied_fingerprint" ] || applied_fingerprint=$before
 
-    if [ "$pending" != true ]; then
+    if [ "$now" -ge "$next_download" ]; then
         _ha_log "开始定时更新全部订阅"
         last_attempt=$now
-        if ! _sub_update --all >>"$CLASH_HA_LOG" 2>&1; then
-            reason="订阅更新失败，${retry} 秒后重试"
-            _ha_log "WARN $reason"
-            _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) false "$applied_fingerprint" '' "$reason"
-            return 0
+        if _ha_subscription_download >>"$CLASH_HA_LOG" 2>&1; then
+            last_download_success=$now
+            next_download=$((now + interval))
+            download_reason="全部订阅下载成功"
+        else
+            next_download=$((now + retry))
+            download_reason="部分或全部订阅下载失败，${retry} 秒后重试；保留失败订阅的缓存"
+            _ha_log "WARN $download_reason"
         fi
-        after=$(_ha_profiles_fingerprint)
-        if [ "$after" = "$applied_fingerprint" ]; then
-            reason="订阅更新成功，内容无变化"
-            _ha_log "$reason"
-            _ha_sub_update_state_write "$last_attempt" "$now" $((now + interval)) false "$after" '' "$reason"
-            return 0
-        fi
+    fi
+
+    after=$(_ha_profiles_fingerprint)
+    if [ "$after" != "$applied_fingerprint" ]; then
+        [ "$pending" = true ] || { pending_since=$now; next_apply=$now; }
+        [ "$pending_fingerprint" = "$after" ] || next_apply=$now
         pending=true
         pending_fingerprint=$after
+    else
+        pending=false
+        pending_since=0
+        pending_fingerprint=''
+        next_apply=0
+        reason="订阅内容无变化；$download_reason"
+        [ "$last_download_success" -ne "$now" ] || last_success=$now
     fi
 
-    if [ "$defer" = true ]; then
+    if [ "$pending" = true ] && [ "$now" -ge "$next_apply" ]; then
         active=$(_ha_active_connections)
-        if [ "$active" -gt 0 ]; then
-            reason="订阅已有变化，检测到 ${active} 条活跃连接，${retry} 秒后再应用"
+        if [ "$mode" = restart ] && [ "$defer" = true ] && [ "$active" -gt 0 ]; then
+            reason="重启应用模式：${active} 条活跃连接，推迟应用；订阅下载继续独立执行"
+            next_apply=$((now + retry))
+        elif applied_snapshot=$(_with_profiles_lock _ha_subscription_apply "$mode"); then
+            applied_fingerprint=$applied_snapshot
+            last_success=$now
+            pending=false
+            pending_since=0
+            pending_fingerprint=''
+            next_apply=0
+            reason="订阅已通过 $mode 应用，更新 HA 节点池；$download_reason"
             _ha_log "$reason"
-            _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) true "$applied_fingerprint" "$pending_fingerprint" "$reason"
-            return 0
+        else
+            reason="订阅应用失败，保留当前配置，${retry} 秒后重试；下载继续独立执行"
+            next_apply=$((now + retry))
+            _ha_log "WARN $reason"
         fi
     fi
+    _ha_sub_update_state_write "$last_attempt" "$last_success" "$next_download" "$next_apply" "$pending" \
+        "$applied_fingerprint" "$pending_fingerprint" "$reason" "$last_download_success" "$pending_since" "$download_reason"
+}
 
-    if _ha_build_and_restart >>"$CLASH_HA_LOG" 2>&1; then
-        _ha_client_config
-        after=$(_ha_profiles_fingerprint)
-        reason="订阅更新已应用并重建 HA 节点池"
-        _ha_log "$reason"
-        _ha_sub_update_state_write "$last_attempt" "$now" $((now + interval)) false "$after" '' "$reason"
-    else
-        reason="订阅已更新但重建失败，${retry} 秒后重试"
-        _ha_log "ERROR $reason"
-        _ha_sub_update_state_write "$last_attempt" "$last_success" $((now + retry)) true "$applied_fingerprint" "$pending_fingerprint" "$reason"
-    fi
+_ha_subscription_worker_cleanup() {
+    local pid
+    pid=$(cat "$CLASH_HA_SUB_UPDATE_PID" 2>/dev/null)
+    [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ] || /usr/bin/rm -f "$CLASH_HA_SUB_UPDATE_PID"
+    return 0
+}
+
+_ha_subscription_update_worker() {
+    trap '_ha_subscription_worker_cleanup' EXIT
+    trap 'exit 0' INT TERM
+    _ha_subscription_update_if_due
+}
+
+_ha_subscription_update_async() {
+    [ "$(_ha_get '.subscription-update.enabled' 'false')" = true ] || return 0
+    local pid now last interval next_download next_apply pending
+    pid=$(cat "$CLASH_HA_SUB_UPDATE_PID" 2>/dev/null)
+    _ha_pid_running "$pid" 'clashctl ha update --due' && return 0
+    now=$(date +%s)
+    last=$(_ha_sub_update_state_get '."last-attempt"' '0')
+    interval=$(_ha_get '.subscription-update.interval' '21600')
+    [[ "$interval" =~ ^[1-9][0-9]*$ ]] || interval=21600
+    next_download=$(_ha_sub_update_state_get '."next-download"' "$((last > 0 ? last + interval : 0))")
+    next_apply=$(_ha_sub_update_state_get '."next-apply"' '0')
+    pending=$(_ha_sub_update_state_get '.pending' 'false')
+    [ "$now" -ge "$next_download" ] || { [ "$pending" = true ] && [ "$now" -ge "$next_apply" ]; } || return 0
+    (
+        exec 7>"${CLASH_HA_SUB_UPDATE_PID}.launch.lock"
+        flock -n 7 || exit 0
+        pid=$(cat "$CLASH_HA_SUB_UPDATE_PID" 2>/dev/null)
+        _ha_pid_running "$pid" 'clashctl ha update --due' && exit 0
+        local runner=()
+        command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
+        nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c \
+            '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha update --due' \
+            </dev/null 7>&- 8>&- 9>&- >>"$CLASH_HA_LOG" 2>&1 &
+        printf '%s\n' "$!" >"$CLASH_HA_SUB_UPDATE_PID"
+    )
+}
+
+_ha_stop_subscription_update() {
+    local pid
+    pid=$(cat "$CLASH_HA_SUB_UPDATE_PID" 2>/dev/null)
+    _ha_pid_running "$pid" 'clashctl ha update --due' && kill -TERM "$pid" 2>/dev/null || true
+    /usr/bin/rm -f "$CLASH_HA_SUB_UPDATE_PID"
 }
 
 _ha_daemon() {
@@ -1019,8 +1197,8 @@ _ha_daemon() {
     while _ha_enabled && [ "$(cat "$CLASH_HA_PID" 2>/dev/null)" = "$$" ]; do
         _ha_check_once || _ha_log "WARN 本轮检测失败，等待内核/API 就绪"
         _ha_codex_check_if_due || _ha_log "WARN Codex 本轮检测失败，等待内核/API 就绪"
-        _ha_subscription_update_if_due || _ha_log "WARN 定时订阅更新任务异常"
-        sleep "$(_ha_get '.interval' '30')" & wait $!
+        _ha_subscription_update_async || _ha_log "WARN 无法派发定时订阅更新任务"
+        sleep "$(_ha_get '.interval' '30')" 7>&- 8>&- 9>&- & wait $!
     done
 }
 
@@ -1048,7 +1226,7 @@ _ha_install_daemon() {
                     [ -n "$pid" ] && _ha_pid_running "$pid" 'clashctl ha daemon' && exit 0
                 fi
                 command -v tini >/dev/null 2>&1 && runner=(tini -s -g --)
-                nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' 8>&- >"$CLASH_HA_LOG" 2>&1 &
+                nohup "${runner[@]}" env CLASHCTL_HOME="$CLASHCTL_HOME" bash -c '. "$CLASHCTL_HOME/scripts/cmd/clashctl.sh"; clashctl ha daemon' </dev/null 7>&- 8>&- 9>&- >>"$CLASH_HA_LOG" 2>&1 &
             )
             for ((i = 0; i < 30; i++)); do
                 [ -f "$CLASH_HA_PID" ] && pid=$(cat "$CLASH_HA_PID" 2>/dev/null)
@@ -1062,13 +1240,16 @@ _ha_install_daemon() {
 
 _ha_ensure_services() {
     _ha_enabled || return 0
-    _ha_install_daemon || _ha_log "WARN 无法启动 HA 调度器"
-    "$BIN_YQ" -e '.lan.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1 || return 0
-    _ha_client_config
-    _ha_start_subscription_server || _ha_log "WARN 无法启动客户端订阅服务"
+    local rc=0
+    _ha_install_daemon || { _ha_log "WARN 无法启动 HA 调度器"; rc=1; }
+    "$BIN_YQ" -e '.lan.enabled == true' "$CLASH_HA_CONFIG" >/dev/null 2>&1 || return "$rc"
+    _ha_client_config || return 1
+    _ha_start_subscription_server || { _ha_log "WARN 无法启动客户端订阅服务"; rc=1; }
+    return "$rc"
 }
 
 _ha_stop_daemon() {
+    _ha_stop_subscription_update
     if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files clashctl-ha.service >/dev/null 2>&1; then
         systemctl disable --now clashctl-ha.service >/dev/null 2>&1 || true
     fi
@@ -1089,10 +1270,12 @@ _ha_stop_daemon() {
         ( exec 7>"${CLASH_HA_PID}.lock"; /usr/bin/flock -n 7 ) && break
         sleep 0.1
     done
+    _ha_stop_subscription_update
 }
 
 _ha_client_config() {
-    local server port user password
+    local server port user password work
+    work=$(mktemp "${CLASH_RESOURCES_DIR}/.ha-client.XXXXXX") || return 1
     server=$(_ha_get '.lan.server' '""')
     port=$(_ha_get '.lan.port' '7890')
     user=$(_ha_get '.lan.username' '""')
@@ -1116,8 +1299,9 @@ _ha_client_config() {
          "DOMAIN-SUFFIX,gitee.com,DIRECT", "DOMAIN-SUFFIX,taobao.com,DIRECT",
          "DOMAIN-SUFFIX,youdao.com,DIRECT", "DOMAIN-SUFFIX,ugnas.com,DIRECT",
          "DOMAIN-SUFFIX,ug.link,DIRECT", "DOMAIN,ws.okx.com,PROXY", "MATCH,PROXY"]}
-    ' >"$CLASH_HA_CLIENT_CONFIG"
-    chmod 600 "$CLASH_HA_CLIENT_CONFIG"
+    ' >"$work" || { /usr/bin/rm -f "$work"; return 1; }
+    chmod 600 "$work"
+    /bin/mv -f "$work" "$CLASH_HA_CLIENT_CONFIG"
 }
 
 _ha_start_subscription_server() {
@@ -1148,8 +1332,15 @@ _ha_start_subscription_server() {
         systemctl daemon-reload && systemctl enable --now clashctl-ha-sub.service
     else
         nohup python3 "$CLASHCTL_HOME/scripts/ha/serve.py" --port "$port" --token-file "$CLASH_HA_SUB_TOKEN" --file "$CLASH_HA_CLIENT_CONFIG" --cidr "$cidr" \
-          >>"$CLASH_HA_LOG" 2>&1 &
+          </dev/null 7>&- 8>&- 9>&- >>"$CLASH_HA_LOG" 2>&1 &
         printf '%s\n' "$!" >"$CLASH_HA_SUB_PID"
+        local attempt
+        for ((attempt = 0; attempt < 30; attempt++)); do
+            _ha_pid_running "$(cat "$CLASH_HA_SUB_PID" 2>/dev/null)" 'scripts/ha/serve.py' || return 1
+            curl -s --noproxy '*' --max-time 1 -o /dev/null "http://127.0.0.1:${port}/" && return 0
+            sleep 0.1
+        done
+        return 1
     fi
 }
 
@@ -1306,12 +1497,16 @@ _ha_subscription_update_status() {
     reason=$(_ha_sub_update_state_get '."last-reason"' '"尚未执行"')
     printf '订阅定时更新：启用（每 %s 秒，待应用：%s）\n' "$(_ha_get '.subscription-update.interval' '21600')" "$pending"
     printf '订阅上次成功：%s\n' "$last_success"
-    printf '订阅下次尝试：%s\n' "$next_attempt"
+    printf '订阅应用方式：%s\n' "$(_ha_get '.subscription-update."apply-mode"' '"reload"')"
+    printf '订阅最近全部下载成功：%s\n' "$(_ha_sub_update_state_get '."last-download-success"' '0')"
+    printf '订阅下次下载：%s\n' "$(_ha_sub_update_state_get '."next-download"' "$next_attempt")"
+    printf '订阅下次应用：%s\n' "$(_ha_sub_update_state_get '."next-apply"' '0')"
     printf '订阅最近结果：%s\n' "$reason"
 }
 
 _ha_status() {
     printf 'HA：%s\n' "$(if _ha_enabled; then printf '启用'; else printf '停用'; fi)"
+    _supervisor_status
     if [ -f "$CLASH_HA_PID" ] && _ha_pid_running "$(cat "$CLASH_HA_PID" 2>/dev/null)" 'clashctl ha daemon'; then
         printf '调度器：运行中\n'
     else
@@ -1355,6 +1550,9 @@ clashha() {
     refresh)
         [ "${2:-}" = --update ] && _sub_update --all
         _ha_build_and_restart
+        ;;
+    update)
+        if [ "${2:-}" = --due ]; then _ha_subscription_update_worker; else _ha_subscription_update_if_due --force; fi
         ;;
     check) _ha_check_once && _ha_status ;;
     status) _ha_status ;;
@@ -1463,6 +1661,7 @@ clashctl ha - 多订阅高可用
   enable                  聚合全部订阅并启动自动优选
   disable                 停用 HA，恢复当前单订阅
   refresh [--update]      重建候选池；--update 先更新全部订阅
+  update                 立即下载订阅并按 apply-mode 应用
   check                   立即检测一次
   status                  查看当前状态
   hold [分钟]             暂停性能切换，故障仍切换（默认 60 分钟）

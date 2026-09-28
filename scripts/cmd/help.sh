@@ -10,6 +10,7 @@ Commands:
   on                    开启代理
   off                   关闭代理
   status                内核状态
+  supervise             容器/无 systemd 服务守护
   ui                    面板地址
   sub                   订阅管理
   node                  节点切换

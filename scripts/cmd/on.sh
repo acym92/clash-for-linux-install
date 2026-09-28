@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 clashon() {
-    case "$1" in
+    case "${1:-}" in
     -e | --env-only)
         on_env_only
         ;;
@@ -28,19 +28,24 @@ on_env_only() {
 }
 
 on_service_only() {
-    service_is_active >&/dev/null && {
-        declare -F _ha_ensure_services >/dev/null && _ha_ensure_services
-        _okcat "$CLASHCTL_KERNEL 已运行"
-        return 0
-    }
-    _detect_proxy_port
-    service_start
-    service_is_active >&/dev/null || {
-        _failcat "$CLASHCTL_KERNEL 启动失败"
+    local ready=false auxiliary_ready=true
+    if ! service_is_active; then
+        _detect_proxy_port
+        service_start || _failcat "$CLASHCTL_KERNEL 启动命令失败"
+    fi
+    service_wait_ready && ready=true
+    # Auxiliary services can start independently and wait for the API themselves.
+    _ha_ensure_services || auxiliary_ready=false
+    _supervisor_start || auxiliary_ready=false
+    [ "$ready" = true ] || {
+        _failcat "$CLASHCTL_KERNEL 尚未就绪，请查看日志；守护进程将继续重试"
         return 1
     }
-    declare -F _ha_ensure_services >/dev/null && _ha_ensure_services
-    _okcat "$CLASHCTL_KERNEL 已启动"
+    [ "$auxiliary_ready" = true ] || {
+        _failcat "内核已就绪，但附属服务未全部启动，请查看 HA/守护日志"
+        return 1
+    }
+    _okcat "$CLASHCTL_KERNEL 与附属服务已就绪"
 }
 
 on_help() {

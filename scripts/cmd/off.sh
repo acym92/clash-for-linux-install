@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 
 clashoff() {
-    case "$1" in
+    case "${1:-}" in
     -e | --env-only)
         off_env_only
         ;;
     -s | --service-only)
         off_service_only || return
-        [ -n "$http_proxy" ] && _failcat "警告：当前终端代理未关闭"
+        if [ -n "${http_proxy:-}" ]; then _failcat "警告：当前终端代理未关闭"; fi
         ;;
     -h | --help)
         off_help
@@ -24,6 +24,9 @@ off_env_only() {
     _okcat "终端代理已关闭"
 }
 off_service_only() {
+    _supervisor_stop || return 1
+    _ha_stop_daemon
+    _ha_stop_subscription_server
     service_is_active >&/dev/null && {
         service_stop >/dev/null
         service_is_active >&/dev/null && tunstatus >&/dev/null && {

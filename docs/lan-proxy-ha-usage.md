@@ -1,8 +1,25 @@
 # 多订阅高可用使用说明
 
-当前实现适用于 Mihomo。推荐使用带 systemd 的 Linux，并以 root 安装，这样 HA 调度器和客户端订阅服务会注册为开机服务。普通用户安装也能运行，但辅助进程不会自动跨系统重启恢复。
+当前实现适用于 Mihomo。systemd 环境会注册 HA 和客户端订阅服务。容器及其他无 systemd 的环境在 `clashctl on` 时启动服务守护，自动补拉退出的内核、HA 调度器和订阅服务；要跨容器启动恢复，还需要由容器已有入口调用下面的启动脚本。
 
 ## 安装和启用
+
+容器已有入口完成 SSH 等初始化后，加入以下命令（路径按实际安装位置调整）：
+
+```bash
+export CLASHCTL_HOME=/root/clashctl
+exec bash "$CLASHCTL_HOME/scripts/init/container.sh"
+```
+
+该脚本等待内核及控制 API 就绪，并启动附属服务和守护进程；启动失败也会继续重试。无需修改 Docker 管理平台配置。更改入口文件只在下次容器启动时生效，当前运行的容器可直接执行 `clashctl on --service-only` 拉起服务，无需重启容器。
+
+```bash
+clashctl supervise status   # 守护进程状态与最近成功检查
+clashctl status             # 内核和守护状态
+clashctl off --service-only # 先停止守护及 HA/订阅服务，再停止内核
+```
+
+默认就绪等待上限 30 秒、守护检查间隔 10 秒；失败重试逐步退避至 60 秒。安装目录 `.env` 中的 `CLASHCTL_SERVICE_READY_TIMEOUT` 和 `CLASHCTL_SUPERVISOR_INTERVAL` 可调整前两项；修改后需重启守护进程。`clashctl supervise stop` 只停止守护，`clashctl off` 会停止所有相关程序。
 
 安装项目后，先添加订阅。第一个订阅作为规则、DNS 等基础模板，所有订阅中的内联 `proxies` 节点会进入统一候选池。
 
@@ -216,12 +233,18 @@ subscription-update:
   enabled: true
   interval: 21600
   retry-interval: 900
+  apply-mode: reload
+  download-via-proxy: true
   defer-when-active: true
 ```
 
 修改后无需重建候选池，调度器下一轮会读取新值。修改 `group` 则必须执行 `clashctl ha refresh`。
 
-定时订阅更新默认每 6 小时执行一次，依次下载并校验全部订阅。内容没有变化时不会重启 Mihomo；内容变化但仍有活跃连接时会标记为待应用，并每 15 分钟检查一次，空闲后才重建 HA 节点池。下载、校验或重建失败时保留当前可用配置。运行 `clashctl ha status` 可以查看上次成功时间、下次尝试时间和待应用状态。
+定时订阅更新默认每 6 小时执行一次，在独立任务中依次下载并校验全部订阅，不阻塞 HA 节点检查。下载和应用分别记录时间；待应用或应用失败不会阻止下一次下载。某个订阅失败时保留它的缓存，其他订阅成功下载的变化仍可应用，失败下载每 15 分钟重试。`download-via-proxy: true` 默认通过当前代理入口获取订阅；需要直连时设为 `false`。
+
+默认 `apply-mode: reload` 使用 [Mihomo 配置 API](https://wiki.metacubex.one/api/#configs) 热重载，不重启内核，不等待全部连接归零，也不主动清空连接。仍存在的已选节点会保留，已有连接继续使用原出口。监听端口、认证或 TUN 等入口配置发生变化时取消热重载并恢复原配置，需显式 `clashctl ha refresh` 应用这类变更。已删除的节点无法继续作为新连接的选择。
+
+如需兼容旧行为，可设 `apply-mode: restart`；此模式下 `defer-when-active: true` 会等待连接空闲再重启，但后台仍按独立周期下载最新订阅。下载、校验或应用失败时保留当前可用配置。`clashctl ha status` 显示下载、应用的独立计划和待应用状态；`clashctl ha update` 可立即执行一次下载与应用。旧状态文件会自动迁移，无需手动删除。
 
 地区偏好只在节点延迟不超过本轮最快节点 100ms 时生效；默认顺序是台湾、日本、香港、其他。同一地区仍选择延迟最低的节点。地区优先切换与普通性能切换一样，需要连续三轮确认并遵守冷却时间。设置 `region-preference.enabled: false` 可关闭地区偏好。
 
